@@ -9,7 +9,7 @@ from typing import Any
 
 DEFAULTS: dict[str, Any] = {
     "host": "0.0.0.0",
-    "port": 9881,
+    "port": 19655,
     "api_key": "",
     "data_dir": str(Path.home() / ".local/share/feiyu-cover/jobs"),
     "rvc": {

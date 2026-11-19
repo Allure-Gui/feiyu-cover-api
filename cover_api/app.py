@@ -3,7 +3,7 @@
 启动：
     python -m cover_api.app
 或：
-    uvicorn cover_api.app:app --host 0.0.0.0 --port 9881
+    uvicorn cover_api.app:app --host 0.0.0.0 --port 19655
 
 接口：
     POST /cover            提交翻唱任务，立即返回 job_id
@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cover.api")
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 CFG = config_module.load_config()
 
 
@@ -522,6 +522,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "cover_api.app:app",
         host=CFG.get("host", "0.0.0.0"),
-        port=int(CFG.get("port", 9881)),
+        port=int(CFG.get("port", 19655)),
         log_level="info",
     )

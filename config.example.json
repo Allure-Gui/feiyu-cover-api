@@ -1,9 +1,8 @@
 {
   "host": "0.0.0.0",
-  "port": 9881,
+  "port": 19655,
   "api_key": "",
   "data_dir": "~/.local/share/feiyu-cover/jobs",
-
   "rvc": {
     "python": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/bin/python",
     "cwd": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/Applio",
@@ -16,9 +15,9 @@
     "f0_method": "rmvpe",
     "command": "\"{python}\" core.py infer --input-path \"{input}\" --output-path \"{output}\" --pth-path \"{model}\" --index-path \"{index}\" --pitch {pitch} --index-rate {index_rate} --protect {protect} --volume-envelope {volume_envelope} --f0-method {f0_method} --embedder-model contentvec --export-format WAV",
     "timeout": 1800,
-    "extra_env": {}
+    "extra_env": {},
+    "models_dir": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/source/logs"
   },
-
   "separate": {
     "python": "/home/YOUR_USER/.local/share/feiyu-voice/demucs/bin/python",
     "model": "htdemucs",
@@ -26,7 +25,6 @@
     "timeout": 1800,
     "command": "\"{python}\" -m demucs --two-stems=vocals -n \"{model}\" -d {device} -o \"{outdir}\" \"{input}\""
   },
-
   "mix": {
     "ffmpeg": "ffmpeg",
     "ffprobe": "ffprobe",
@@ -37,16 +35,19 @@
     "loudnorm": true,
     "sample_rate": 44100
   },
-
   "source": {
     "provider": "txqq",
     "txqq_base": "https://music.txqq.pro/",
     "cookie": "",
     "search_limit": 5,
     "bili_enabled": true,
-    "order": ["bilibili", "gd", "txqq", "qq"]
+    "order": [
+      "bilibili",
+      "gd",
+      "txqq",
+      "qq"
+    ]
   },
-
   "limits": {
     "max_song_seconds": 420,
     "max_queue": 8

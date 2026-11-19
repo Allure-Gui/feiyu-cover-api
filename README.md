@@ -69,13 +69,13 @@ cp config.example.json config.json
 启动：
 
 ```bash
-.venv/bin/python -m uvicorn cover_api.app:app --host 0.0.0.0 --port 9881
+.venv/bin/python -m uvicorn cover_api.app:app --host 0.0.0.0 --port 19655
 ```
 
 健康检查：
 
 ```bash
-curl http://127.0.0.1:9881/health
+curl http://127.0.0.1:19655/health
 # {"status":"ok","version":"0.2.0",...,"source_order":["bilibili",...],"bili_enabled":true}
 ```
 
@@ -126,7 +126,7 @@ git pull
 提交示例：
 
 ```bash
-curl -X POST http://127.0.0.1:9881/cover \
+curl -X POST http://127.0.0.1:19655/cover \
   -H "Content-Type: application/json" \
   -d '{"song":"起风了","voice":{"pitch":0,"index_rate":0.42}}'
 ```
