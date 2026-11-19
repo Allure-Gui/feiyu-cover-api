@@ -383,3 +383,7 @@ api_stop_cmd = "wsl.exe -d Ubuntu-24.04 -- bash /path/to/stop-api.wsl.sh"
 - Demucs：[facebookresearch/demucs](https://github.com/facebookresearch/demucs)
 
 > 本项目不附带任何模型权重或音频素材。训练数据请自行确保合法授权，翻唱与分发请遵守当地版权法规。
+
+---
+
+> **PS：不懂或者嫌麻烦，可以直接将本项目丢给 AI 许愿。**
