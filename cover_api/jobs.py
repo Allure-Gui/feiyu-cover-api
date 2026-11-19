@@ -221,6 +221,17 @@ class JobManager:
                 self._queue.task_done()
 
     # ---------------- 清理 ----------------
+    def forget(self, job_id: str) -> None:
+        """从内存任务表移除某任务（磁盘由 cleanup 模块删除）。"""
+        with self._lock:
+            self._jobs.pop(job_id, None)
+
+    def forget_many(self, job_ids) -> None:
+        """批量移除，供缓存清理后同步内存表。"""
+        with self._lock:
+            for jid in job_ids:
+                self._jobs.pop(jid, None)
+
     def cleanup(self, keep: int = 30) -> None:
         """只保留最近 N 个任务目录，避免磁盘膨胀。"""
         folders = sorted(

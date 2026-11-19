@@ -259,11 +259,13 @@ def run(job: Job, mgr: JobManager) -> None:
     # 必须重新生成，否则会一直复用切换前拿错源的旧成品。
     mix_tag = _hash_json(cfg.get("mix") or {})[:8]
     source_tag = _hash_json(cfg.get("source") or {})[:8]
+    # v2: 八度移调不再跟随伴奏（A/B 实测修正），变更缓存键让旧成品失效
+    logic_tag = "v2"
     cached = final_cache / (
         f"{audio_sha}_p{pitch}_ir{index_rate}_pr{protect}_ve{volume_envelope}"
         f"_{f0_method}_f{int(formant_shifting)}{formant_qfrency}_{formant_timbre}"
         f"_eq{int(eq_on)}{presence_db}_{air_db}"
-        f"_m{mix_tag}_s{source_tag}_{model_tag}.{out_format}"
+        f"_m{mix_tag}_s{source_tag}_{model_tag}_{logic_tag}.{out_format}"
     )
 
     output = workdir / f"cover.{out_format}"
@@ -421,14 +423,22 @@ def _mix(cfg: dict, vocals: Path, instrumental: Path, output: Path,
             logger.info("自动配平：人声 %.1fdB→%.1fdB (+%.1f)，伴奏 %.1fdB→%.1fdB (+%.1f)",
                         v_db, v_target, v_gain, i_db, i_target, i_gain)
 
-    # 人声被移调后，伴奏必须跟着移到同一个调，否则整首歌跑调
+    # 伴奏是否跟随人声移调——A/B 实测修正（2026-11-19）：
+    # pitch 为 12 的倍数（±12/±24）时，人声只是升/降八度的整数倍，音名不变，
+    # 与伴奏和弦天然协和，无需移伴奏；反而 asetrate 会把鼓点/贝斯一起升调，
+    # 破坏伴奏音色（底鼓变尖、贝斯变薄）。只有非八度移调（如 ±4）才需要
+    # 伴奏跟随，否则人声音名与原调和弦对不上，那才是真的跑调。
     inst_chain = f"volume={i_gain}dB"
-    if pitch and mix.get("follow_pitch", True):
+    octave_shift = (pitch % 12 == 0)  # 0、±12、±24 等八度倍数
+    if pitch and mix.get("follow_pitch", True) and not octave_shift:
         ratio = 2 ** (pitch / 12.0)
         inst_chain = (
             f"asetrate={sr}*{ratio:.6f},aresample={sr},"
             f"atempo={1.0 / ratio:.6f},{inst_chain}"
         )
+        logger.info("非八度移调 pitch=%s，伴奏跟随移至同调", pitch)
+    elif pitch and octave_shift:
+        logger.info("八度移调 pitch=%s，伴奏保持原调（音名不变，天然协和）", pitch)
 
     # 人声处理链：低切 + presence + air + 轻压缩
     v_chain = f"volume={v_gain}dB"

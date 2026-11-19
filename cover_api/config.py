@@ -79,6 +79,14 @@ DEFAULTS: dict[str, Any] = {
         "max_song_seconds": 420,
         "max_queue": 8,
     },
+    # 缓存清理：按天数 / 总容量 / 任务数三种阈值，任一超阈值即清理最旧的文件。
+    "cleanup": {
+        "enabled": True,           # 是否启用自动清理（启动时 + 每 24 小时）
+        "max_age_days": 7,         # 缓存文件保留天数，0 = 不按时间清
+        "max_size_mb": 2048,       # 缓存总容量上限 MB，0 = 不按容量清
+        "keep_jobs": 30,           # 保留最近 N 个任务目录，0 = 不按数量清
+        "check_interval_hours": 24,  # 自动检查间隔（小时）
+    },
 }
 
 
@@ -151,3 +159,17 @@ def validate(cfg: dict) -> list[str]:
     if sep_python and not Path(sep_python).exists():
         problems.append(f"分离环境 python 不存在: {sep_python}")
     return problems
+
+
+def save_config(cfg: dict) -> str:
+    """把当前配置写回 config.json（保留除 _config_path 外的所有字段）。
+
+    返回写入的配置文件路径。原子写，避免中途失败损坏配置。
+    """
+    path = Path(cfg.get("_config_path") or Path(__file__).with_name("config.json"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {k: v for k, v in cfg.items() if k != "_config_path"}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return str(path)

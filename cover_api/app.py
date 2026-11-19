@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import secrets
 import time
@@ -29,6 +31,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import config as config_module
+from . import cleanup as cleanup_module
 from . import pipeline
 from .jobs import JobManager
 
@@ -38,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cover.api")
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 CFG = config_module.load_config()
 
 
@@ -97,9 +100,28 @@ async def lifespan(_: FastAPI):
         logger.info("配置自检通过")
     manager.start()
     logger.info("翻唱服务已启动，监听 %s:%s", CFG["host"], CFG["port"])
+
+    # 缓存清理：启动时先按配置清一次，再起每日定时任务
+    cleanup_task = None
+    cleanup_cfg = CFG.get("cleanup") or {}
+    root = Path(CFG["data_dir"])
+    if cleanup_cfg.get("enabled", True):
+        try:
+            res = cleanup_module.clean(root, cleanup_cfg, on_job_removed=manager.forget_many)
+            logger.info("启动缓存清理: %s", res)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动缓存清理失败: %s", exc)
+        cleanup_task = asyncio.create_task(
+            cleanup_module.periodic(manager, lambda: CFG.get("cleanup") or {},
+                                    cleanup_cfg.get("check_interval_hours", 24))
+        )
     try:
         yield
     finally:
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            with contextlib.suppress(Exception):
+                await cleanup_task
         manager.stop()
 
 
@@ -130,6 +152,68 @@ def health() -> dict[str, Any]:
         "source_order": CFG.get("source", {}).get("order") or [],
         "bili_enabled": bool(CFG.get("source", {}).get("bili_enabled", False)),
     }
+
+
+@app.get("/cache/stats", dependencies=[Depends(_auth)])
+def cache_stats() -> dict[str, Any]:
+    """缓存占用统计，供插件 WebUI 展示。"""
+    root = Path(CFG["data_dir"])
+    try:
+        return {
+            "ok": True,
+            "cache_mb": round(cleanup_module._dir_size(root / "cache") / 1024 / 1024, 1),
+            "config": {
+                "enabled": (CFG.get("cleanup") or {}).get("enabled", True),
+                "max_age_days": (CFG.get("cleanup") or {}).get("max_age_days", 7),
+                "max_size_mb": (CFG.get("cleanup") or {}).get("max_size_mb", 2048),
+                "keep_jobs": (CFG.get("cleanup") or {}).get("keep_jobs", 30),
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class CleanupConfigRequest(BaseModel):
+    enabled: bool = Field(default=True, description="是否启用自动清理")
+    max_age_days: int = Field(default=7, ge=0, le=3650, description="缓存保留天数，0=不按时间清")
+    max_size_mb: int = Field(default=2048, ge=0, le=102400, description="缓存容量上限 MB，0=不按容量清")
+    keep_jobs: int = Field(default=30, ge=0, le=10000, description="保留任务数，0=不按数量清")
+    check_interval_hours: int = Field(default=24, ge=1, le=720, description="自动检查间隔小时")
+
+
+@app.post("/cache/config", dependencies=[Depends(_auth)])
+def cache_config(req: CleanupConfigRequest) -> dict[str, Any]:
+    """更新缓存清理阈值，立即生效并写入 config.json 持久化。"""
+    try:
+        CFG["cleanup"] = req.model_dump()
+        path = config_module.save_config(CFG)
+        return {"ok": True, "config": req.model_dump(), "saved_to": path}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"保存配置失败：{exc}") from None
+
+
+class CleanRequest(BaseModel):
+    force: bool = Field(default=False, description="强制清空所有缓存（忽略阈值）")
+
+
+@app.post("/cache/clean", dependencies=[Depends(_auth)])
+def cache_clean(req: CleanRequest | None = None) -> dict[str, Any]:
+    """触发缓存清理。默认按配置阈值；force=true 强制清空全部缓存。"""
+    try:
+        root = Path(CFG["data_dir"])
+        # 跳过正在运行/排队的任务，避免删掉活动任务内存记录
+        skip = set()
+        active = getattr(manager, "_active", None)
+        if active:
+            skip.add(active)
+        if req and req.force:
+            res = cleanup_module.clean_all(root, skip_names=skip, on_job_removed=manager.forget_many)
+        else:
+            res = cleanup_module.clean(root, CFG.get("cleanup") or {},
+                                       skip_names=skip, on_job_removed=manager.forget_many)
+        return {"ok": True, **res}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"清理失败：{exc}") from None
 
 
 class CutTargetRequest(BaseModel):
@@ -203,6 +287,19 @@ def bili_probe(keyword: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+class MixSettingRequest(BaseModel):
+    follow_pitch: bool | None = Field(default=None, description="伴奏是否跟随人声移调")
+
+
+@app.post("/tools/set-mix", dependencies=[Depends(_auth)])
+def set_mix(req: MixSettingRequest) -> dict[str, Any]:
+    """运行时调整混音设置（仅内存生效，重启还原）。用于 A/B 实验等临时场景。"""
+    mix = CFG.setdefault("mix", {})
+    if req.follow_pitch is not None:
+        mix["follow_pitch"] = bool(req.follow_pitch)
+    return {"ok": True, "follow_pitch": mix.get("follow_pitch", True)}
 
 
 @app.post("/tools/cut-target", dependencies=[Depends(_auth)])
