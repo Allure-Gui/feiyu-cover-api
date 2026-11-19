@@ -1,8 +1,10 @@
-# 鲸歌翻唱 API
+<div align="center">
+  <img src="assets/icon.png" width="96" alt="鲸歌">
+  <h1>鲸歌翻唱 API</h1>
+  <p>本地翻唱服务：搜歌 → 人声分离 → RVC 换声 → 混音 → 出声。</p>
+</div>
 
-> 本地点歌翻唱服务：**搜歌 → 人声分离 → RVC 换声 → 混音 → 出声**，对外提供 HTTP 接口，供 [feiyu-cover-plugin](https://github.com/Allure-Gui/feiyu-cover-plugin) 调用。
-
-设计目标是「家用显卡能跑、群里点歌能用」：单卡 8GB 显存、单任务串行、40~90 秒出一首。
+<p align="center">本服务为 <a href="https://github.com/Allure-Gui/feiyu-cover-plugin">鲸歌 · 麦麦翻唱插件</a> 提供后端能力，也可独立通过 HTTP 接口调用。</p>
 
 ---
 
