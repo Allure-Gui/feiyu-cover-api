@@ -7,6 +7,8 @@
 <p align="center">本服务为 <a href="https://github.com/Allure-Gui/feiyu-cover-plugin">鲸歌 · 麦麦翻唱插件</a> 提供后端能力，也可独立通过 HTTP 接口调用。</p>
 
 > 📖 **新手必读**：[训练音色与连接完整指南](TRAINING_GUIDE.md) —— 从准备声音素材、训练 RVC 模型，到配置 API、接入麦麦插件的分步教程。
+>
+> 💡 **不懂或者嫌麻烦，可以直接将本项目丢给 AI 许愿。**
 
 ---
 
