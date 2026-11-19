@@ -171,6 +171,28 @@ def run(job: Job, mgr: JobManager) -> None:
         shutil.copyfile(found_inst, instrumental)
         step("separating", 0.4, "分离完成")
 
+    # ---- 2.5 人声有效性校验 ----
+    # 有些音源标题写着"某某版"，实际是纯伴奏或鬼畜拼接，分离出来人声轨几乎静音。
+    # 不拦住的话会白跑一次 RVC，成品听起来就是"只有伴奏"。
+    title = (job.meta or {}).get("title") or job.spec.get("song") or "这首歌"
+    min_vocal_db = float(cfg.get("mix", {}).get("min_vocal_db", -45.0))
+    min_ratio = float(cfg.get("mix", {}).get("min_vocal_active_ratio", 0.3))
+
+    vocal_db = _mean_volume(cfg, vocals)
+    vocal_dur = _probe_duration(vocals, cfg["mix"].get("ffprobe", "ffprobe")) or 0.0
+    active_ratio = _vocal_active_ratio(cfg, vocals, vocal_dur, threshold_db=min_vocal_db)
+
+    # 平均值会被"前奏有一点声"抬上去，所以按"有效人声占比"判断更准。
+    # 实测：纯伴奏的人声轨平均 -27dB 看着正常，但 80% 的时长是静音。
+    if active_ratio is not None and active_ratio < min_ratio:
+        raise PipelineError(
+            f"《{title}》没有可用人声（有效人声只占 {active_ratio*100:.0f}% 的时长，"
+            f"低于 {min_ratio*100:.0f}%），多半是伴奏版或纯音乐版。"
+            f"换个版本，或者自己上传带人声的音频。"
+        )
+    if active_ratio is not None:
+        logger.info("人声有效性：占比 %.0f%%（平均 %.1f dB），通过", active_ratio * 100, vocal_db or 0)
+
     # ---- 3. RVC 换声 ----
     rvc_cfg = cfg["rvc"]
 
@@ -231,12 +253,17 @@ def run(job: Job, mgr: JobManager) -> None:
     model_tag = _sha256_file(model_path)[:8]
     final_cache = cache_root / "final"
     out_format = (cfg["mix"].get("out_format") or "mp3").lower()
-    # 缓存键必须包含全部音色参数，否则改完参数会命中旧成品
+    # 缓存键必须覆盖"会影响成品"的全部因素：音色参数 + 混音配置 + 音源配置。
+    # 少了混音这一段，改增益/响度后仍会命中旧成品，看起来像"改了没用"。
+    # 音源配置也要算进去：切换/新增音源（如接入 B 站）后，即使同一首歌也
+    # 必须重新生成，否则会一直复用切换前拿错源的旧成品。
+    mix_tag = _hash_json(cfg.get("mix") or {})[:8]
+    source_tag = _hash_json(cfg.get("source") or {})[:8]
     cached = final_cache / (
         f"{audio_sha}_p{pitch}_ir{index_rate}_pr{protect}_ve{volume_envelope}"
         f"_{f0_method}_f{int(formant_shifting)}{formant_qfrency}_{formant_timbre}"
         f"_eq{int(eq_on)}{presence_db}_{air_db}"
-        f"_{model_tag}.{out_format}"
+        f"_m{mix_tag}_s{source_tag}_{model_tag}.{out_format}"
     )
 
     output = workdir / f"cover.{out_format}"
@@ -309,6 +336,68 @@ def run(job: Job, mgr: JobManager) -> None:
     logger.info("[%s] 全部完成，用时 %.0fs", job.id, time.time() - started)
 
 
+def _vocal_active_ratio(cfg: dict, path: Path, duration: float,
+                        threshold_db: float = -45.0) -> float | None:
+    """估算"有人声"的时长占比：用 silencedetect 统计静音段总长。"""
+    import re as _re
+    import subprocess
+
+    if not duration or duration <= 0:
+        return None
+    ffmpeg = cfg["mix"].get("ffmpeg", "ffmpeg")
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+             "-af", f"silencedetect=noise={threshold_db}dB:d=0.8", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=300, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    silence = 0.0
+    for m in _re.finditer(r"silence_duration: ([0-9.]+)", proc.stderr or ""):
+        silence += float(m.group(1))
+    # 结尾常有一大段静音被算进来，按实际时长封顶
+    silence = min(silence, duration)
+    return max(0.0, (duration - silence) / duration)
+
+
+def _hash_json(data: Any) -> str:
+    """对配置做稳定哈希，用作缓存键的一部分。"""
+    import hashlib
+    import json as _json
+
+    return hashlib.sha256(
+        _json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _mean_volume(cfg: dict, path: Path) -> float | None:
+    """用 ffmpeg volumedetect 测平均电平（dB），测不到返回 None。"""
+    import subprocess
+
+    ffmpeg = cfg["mix"].get("ffmpeg", "ffmpeg")
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=180, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (proc.stderr or "").splitlines():
+        if "mean_volume:" in line:
+            try:
+                return float(line.split("mean_volume:")[1].split("dB")[0].strip())
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
 def _mix(cfg: dict, vocals: Path, instrumental: Path, output: Path,
          log_path: Path, pitch: int = 0, eq_on: bool = True,
          presence_db: float = 2.5, air_db: float = 1.5) -> None:
@@ -317,6 +406,20 @@ def _mix(cfg: dict, vocals: Path, instrumental: Path, output: Path,
     sr = int(mix.get("sample_rate", 44100))
     v_gain = float(mix.get("vocal_gain_db", -3.0))
     i_gain = float(mix.get("inst_gain_db", -9.0))
+
+    # 固定增益只在"人声本来就饱满"时成立。有些音源人声很轻（例如翻唱版、
+    # 混音偏伴奏的版本），固定 -3/-9 会让伴奏压过人声，听起来像"只有伴奏"。
+    # 所以按实测响度配平到目标电平，再叠加用户配置的偏移。
+    if mix.get("auto_gain", True):
+        v_db = _mean_volume(cfg, vocals)
+        i_db = _mean_volume(cfg, instrumental)
+        if v_db is not None and i_db is not None:
+            v_target = float(mix.get("vocal_target_db", -14.0))
+            i_target = float(mix.get("inst_target_db", -18.5))
+            v_gain = _clamp(v_target - v_db, -24.0, 18.0)
+            i_gain = _clamp(i_target - i_db, -24.0, 18.0)
+            logger.info("自动配平：人声 %.1fdB→%.1fdB (+%.1f)，伴奏 %.1fdB→%.1fdB (+%.1f)",
+                        v_db, v_target, v_gain, i_db, i_target, i_gain)
 
     # 人声被移调后，伴奏必须跟着移到同一个调，否则整首歌跑调
     inst_chain = f"volume={i_gain}dB"

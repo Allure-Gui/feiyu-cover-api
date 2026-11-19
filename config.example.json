@@ -3,53 +3,50 @@
   "port": 9881,
   "api_key": "",
   "data_dir": "~/.local/share/feiyu-cover/jobs",
+
   "rvc": {
-    "python": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/venv/bin/python",
-    "cwd": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/source",
-    "model": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/source/logs/YOUR_MODEL/G_XXXX.pth",
-    "index": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/source/logs/YOUR_MODEL/YOUR_MODEL.index",
+    "python": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/bin/python",
+    "cwd": "/home/YOUR_USER/.local/share/feiyu-voice/cuda/rvc/Applio",
+    "model": "/home/YOUR_USER/.local/share/feiyu-voice/astrbot_plugin_feiyu_voice/server/models/FeiyuVoice-RVC/FeiyuVoice-RVC-v1.pth",
+    "index": "/home/YOUR_USER/.local/share/feiyu-voice/astrbot_plugin_feiyu_voice/server/models/FeiyuVoice-RVC/FeiyuVoice-RVC-v1.index",
     "pitch": 0,
-    "index_rate": 0.5,
-    "protect": 0.25,
-    "volume_envelope": 0.7,
+    "index_rate": 0.3,
+    "protect": 0.33,
+    "volume_envelope": 0.25,
     "f0_method": "rmvpe",
-    "extra_env": {},
-    "formant_shifting": false,
-    "formant_qfrency": 1.0,
-    "formant_timbre": 1.0,
-    "command": "\"{python}\" core.py infer --input-path \"{input}\" --output-path \"{output}\" --pth-path \"{model}\" --index-path \"{index}\" --pitch {pitch} --index-rate {index_rate} --protect {protect} --volume-envelope {volume_envelope} --f0-method {f0_method} --embedder-model contentvec --export-format WAV {formant_flag} --formant-qfrency {formant_qfrency} --formant-timbre {formant_timbre}"
+    "command": "\"{python}\" core.py infer --input-path \"{input}\" --output-path \"{output}\" --pth-path \"{model}\" --index-path \"{index}\" --pitch {pitch} --index-rate {index_rate} --protect {protect} --volume-envelope {volume_envelope} --f0-method {f0_method} --embedder-model contentvec --export-format WAV",
+    "timeout": 1800,
+    "extra_env": {}
   },
+
   "separate": {
     "python": "/home/YOUR_USER/.local/share/feiyu-voice/demucs/bin/python",
     "model": "htdemucs",
-    "device": "cuda"
+    "device": "cuda",
+    "timeout": 1800,
+    "command": "\"{python}\" -m demucs --two-stems=vocals -n \"{model}\" -d {device} -o \"{outdir}\" \"{input}\""
   },
+
   "mix": {
     "ffmpeg": "ffmpeg",
+    "ffprobe": "ffprobe",
     "vocal_gain_db": -3.0,
     "inst_gain_db": -9.0,
     "out_format": "mp3",
     "bitrate": "320k",
-    "ffprobe": "ffprobe",
-    "follow_pitch": true
+    "loudnorm": true,
+    "sample_rate": 44100
   },
+
   "source": {
     "provider": "txqq",
     "txqq_base": "https://music.txqq.pro/",
     "cookie": "",
-    "order": [
-      "gd",
-      "txqq",
-      "qq"
-    ],
-    "qq_cookie_file": "~/feiyu-cover/qq-cookie.txt",
-    "gd_api": "https://music-api.gdstudio.xyz/api.php",
-    "gd_sources": [
-      "netease",
-      "joox"
-    ],
-    "allow_cover_fallback": true
+    "search_limit": 5,
+    "bili_enabled": true,
+    "order": ["bilibili", "gd", "txqq", "qq"]
   },
+
   "limits": {
     "max_song_seconds": 420,
     "max_queue": 8

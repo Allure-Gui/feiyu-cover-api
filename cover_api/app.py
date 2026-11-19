@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cover.api")
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CFG = config_module.load_config()
 
 
@@ -69,6 +69,7 @@ class CoverRequest(BaseModel):
     song: str | None = Field(default=None, description="歌曲名或关键词")
     audio_url: str | None = Field(default=None, description="音频直链")
     audio_path: str | None = Field(default=None, description="本地音频绝对路径")
+    candidate_index: int = Field(default=0, ge=0, le=9, description="用第几个搜索结果（0 起），人声校验失败时可用下一个重试")
     pitch: int | None = Field(default=None, ge=-24, le=24, description="变调半音，男声歌建议 12")
     voice: VoiceOverride | None = Field(default=None, description="音色参数覆盖")
     requester: str = Field(default="", description="点歌人标识")
@@ -125,6 +126,9 @@ def health() -> dict[str, Any]:
         "uptime": round(time.time() - STARTED, 1),
         "queue": manager._queue.qsize(),  # noqa: SLF001
         "running": bool(active),
+        # 暴露音源配置，便于确认「B 站音源」是否已随重启加载（0.2.0+）
+        "source_order": CFG.get("source", {}).get("order") or [],
+        "bili_enabled": bool(CFG.get("source", {}).get("bili_enabled", False)),
     }
 
 
@@ -175,6 +179,30 @@ def source_probe(title: str, artist: str = "", album: str = "") -> dict[str, Any
             item["error"] = f"{type(exc).__name__}: {exc}"
         report.append(item)
     return {"title": title, "artist": artist, "album": album, "sources": report}
+
+
+@app.get("/tools/bili-probe", dependencies=[Depends(_auth)])
+def bili_probe(keyword: str) -> dict[str, Any]:
+    """诊断 B 站音源：检测是否命中、搜索到什么、能否取到音频流。"""
+    from cover_api import sources as src_mod
+
+    cfg = config_module.load_config()
+    out: dict[str, Any] = {
+        "keyword": keyword,
+        "wants_bilibili": src_mod._wants_bilibili(keyword),
+        "bili_enabled": bool(cfg.get("source", {}).get("bili_enabled", True)),
+    }
+    try:
+        tracks = src_mod._search_bilibili(cfg, keyword, limit=5)
+        out["tracks"] = [
+            {"title": t["title"], "artist": t.get("artist", ""), "bvid": t.get("bvid", "")}
+            for t in tracks
+        ]
+        if tracks:
+            out["audio_url_ok"] = bool(src_mod._bili_audio_url(cfg, tracks[0]["bvid"]))
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 @app.post("/tools/cut-target", dependencies=[Depends(_auth)])
