@@ -18,62 +18,125 @@ DEFAULTS: dict[str, Any] = {
         "model": "",
         "index": "",
         # 训练产物的根目录，/models 接口会扫这里的子目录
-        "models_dir": "/root/.local/share/feiyu-voice/cuda/rvc/source/logs",
+        "models_dir": str(Path.home() / ".local/share/feiyu-voice/cuda/rvc/source/logs"),
         "pitch": 0,
-        "index_rate": 0.3,
-        "protect": 0.33,
+        "index_rate": 0.28,
+        "protect": 0.45,
         "volume_envelope": 0.25,
         "f0_method": "rmvpe",
-        # 共振峰偏移：只改音色的"年龄感/性别感"，不动音高，伴奏不用跟着移调
+        # 共振峰偏移：默认关闭，避免 StftPitchShift 引入相位毛刺与额外耗时
         "formant_shifting": False,
         "formant_qfrency": 1.0,
         "formant_timbre": 1.0,
+        # 4060 Ti 8GB 低负载与提速配置：按需常驻 worker + 空闲自动退出释放显存
+        "use_worker": True,
+        "idle_unload_seconds": 180,
+        "cpu_threads": 4,
+        "nice": 10,
+        "trim_silence": True,
+        "auto_pitch": True,
+        "auto_pitch_threshold_hz": 165.0,
+        "f0_autotune": False,
+        "f0_autotune_strength": 0.5,
         "command": (
             '"{python}" core.py infer --input-path "{input}" --output-path "{output}" '
             '--pth-path "{model}" --index-path "{index}" --pitch {pitch} '
             "--index-rate {index_rate} --protect {protect} "
             "--volume-envelope {volume_envelope} --f0-method {f0_method} "
             "--embedder-model contentvec --export-format WAV "
-            "{formant_flag} --formant-qfrency {formant_qfrency} --formant-timbre {formant_timbre}"
+            "{formant_flag} --formant-qfrency {formant_qfrency} --formant-timbre {formant_timbre} "
+            "{autotune_flag}"
         ),
         "timeout": 1800,
         "extra_env": {},
     },
     "separate": {
         "python": "",
-        "model": "htdemucs",
+        "model": "vocals_mel_band_roformer.ckpt",
+        "model_dir": str(Path.home() / ".local/share/feiyu-voice/separator-models"),
+        # 二段人声提纯（仅当对应模型已下载到 model_dir 时生效）：去和声叠唱 + 去湿混响，根治沙嗓/电音
+        "purify_vocals": True,
+        "karaoke_model": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+        "dereverb_model": "UVR-DeEcho-DeReverb.pth",
+        "keep_harmony_db": -4.0,
         "device": "cuda",
+        "segment": 7,
+        "overlap": 2,
+        "batch_size": 2,
+        "cpu_threads": 4,
+        "nice": 10,
         "timeout": 1800,
-        "command": '"{python}" -m demucs --two-stems=vocals -n "{model}" -d {device} -o "{outdir}" "{input}"',
+        "command": (
+            '"{bin_dir}/audio-separator" -m "{model}" --model_file_dir "{model_dir}" '
+            '--output_dir "{outdir}" --output_format WAV --use_soundfile --use_autocast '
+            '--mdxc_overlap {overlap} --mdxc_batch_size {batch_size} "{input}"'
+        ),
     },
     "mix": {
         "ffmpeg": "ffmpeg",
         "ffprobe": "ffprobe",
+        "ffmpeg_threads": 4,
         "vocal_gain_db": -3.0,
         "inst_gain_db": -9.0,
         "out_format": "mp3",
         "bitrate": "320k",
         "loudnorm": True,
         "sample_rate": 44100,
-        # 移调时伴奏是否跟着移：不移会跑调（人声升 4 个半音，伴奏还在原调）
+        # 伴奏跟随移调：仅非八度移调（如 ±4）才需要跟随；±12/±24 音名不变，
+        # 跟随反而会用 asetrate 破坏鼓点/贝斯音色，故 pipeline 会自动跳过。
         "follow_pitch": True,
         # 人声增强：转换出来的人声没做过混音处理，直接怼伴奏会发闷、发小
         "vocal_eq": True,
-        "vocal_presence_db": 2.5,   # 3kHz 附近，提升咬字清晰度
-        "vocal_air_db": 1.5,        # 9kHz 以上，提升明亮度
-        "vocal_lowcut_hz": 80,      # 切掉低频轰鸣
-        "vocal_compress": True,     # 轻压缩，让音量更整齐
-        # 语音条片段：QQ 语音有时长上限，整首歌塞不进去，单独切一段
+        "vocal_presence_db": 2.0,   # 3.2kHz 清晰度（温和不刺耳）
+        "vocal_deess_db": -2.2,     # 6.2kHz 柔化齿音与 RVC 高频毛刺（去「哧啦」感）
+        "vocal_air_db": 0.9,        # 8.5kHz 轻柔空气感
+        "vocal_lowcut_hz": 90,      # 切掉低频轰鸣与残留低频串音
+        "vocal_mud_cut_db": -2.2,   # 280Hz 轻微削浑浊，让人声更通透
+        "vocal_gate_on": True,      # 轻度气口底噪门控（防压缩器把换气沙沙声抬起来）
+        "vocal_compress": True,     # 带补偿增益轻压缩，压稳峰值且不降人声响度
+        "vocal_reverb": True,       # 极克制的短房间空间感，消除贴片感且不拉糊字尾
+        "vocal_reverb_mix": 0.06,   # 左右非对称早期反射干湿比（单声道 100% 兼容）
+        "inst_vocal_pocket_db": -1.5,  # 伴奏 3kHz 轻度让位，突出主唱又不削薄配乐
+        "inst_sidechain": True,     # 人声侧链温和动态闪避伴奏（约 -1.2 dB）
+        # 自动配平：优先用 ITU EBU R128 门控 LUFS（忽略前奏静音，避免长前奏歌曲过度提声）
+        "auto_gain": True,
+        "loudness_mode": "lufs",
+        "vocal_target_db": -12.0,
+        "inst_target_db": -15.5,
+        # 纯伴奏拦截：分离出的人声低于该占比时视为拿错源（翻唱/纯音乐）
+        "min_vocal_db": -45.0,
+        "min_vocal_active_ratio": 0.3,
+        # 语音条片段：给 WebUI 试听与 QQ 发送提供高质源，避免 64k 单声道双重压缩糊音
         "voice_clip": True,
         "voice_clip_seconds": 60,
         "voice_clip_offset_ratio": 0.3,   # 从 30% 处开始，通常已是主歌进副歌
-        "voice_bitrate": "64k",
+        "voice_sample_rate": 44100,
+        "voice_channels": 2,
+        "voice_bitrate": "192k",
     },
     "source": {
         "provider": "txqq",
         "txqq_base": "https://music.txqq.pro/",
+        "txqq_types": ["kugou", "netease"],
         "cookie": "",
-        "search_limit": 5,
+        "search_limit": 8,
+        # 音源优先级与兜底策略
+        "order": ["bilibili", "gd", "txqq", "qq"],
+        "allow_cover_fallback": True,
+        "bili_fallback": True,
+        "meting_enabled": True,
+        # GD 聚合源（gdstudio，仅保留实测可用的 netease）
+        "gd_api": "https://music-api.gdstudio.xyz/api.php",
+        "gd_sources": ["netease"],
+        # B 站音源（补 B 站独占的二创/鬼畜版本）
+        "bili_enabled": True,
+        "bili_search_api": "https://api.bilibili.com/x/web-interface/search/type",
+        "bili_view_api": "https://api.bilibili.com/x/web-interface/view",
+        "bili_play_api": "https://api.bilibili.com/x/player/playurl",
+        "bili_cookie": "",
+        # QQ 官方源（依赖 cookie，容易过期，仅作补充）
+        "qq_cookie": "",
+        "qq_cookie_file": "",
     },
     "limits": {
         "max_song_seconds": 420,
@@ -105,10 +168,13 @@ def _as_bool(value: str) -> bool:
 
 
 def load_config(path: str | os.PathLike | None = None) -> dict:
-    """读取配置。优先 FEIYU_COVER_CONFIG 环境变量，其次同目录 config.json。"""
-    config_path = Path(
-        path or os.environ.get("FEIYU_COVER_CONFIG") or Path(__file__).with_name("config.json")
-    )
+    """读取配置。优先 FEIYU_COVER_CONFIG 环境变量，其次 cover_api/config.json，再次仓库根目录 config.json。"""
+    if path or os.environ.get("FEIYU_COVER_CONFIG"):
+        config_path = Path(path or os.environ["FEIYU_COVER_CONFIG"])
+    else:
+        inner = Path(__file__).with_name("config.json")
+        outer = Path(__file__).resolve().parent.parent / "config.json"
+        config_path = inner if inner.is_file() else (outer if outer.is_file() else inner)
     raw: dict = {}
     if config_path.is_file():
         raw = json.loads(config_path.read_text(encoding="utf-8-sig"))

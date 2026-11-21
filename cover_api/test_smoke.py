@@ -2,8 +2,10 @@
 import os
 import sys
 import tempfile
+from pathlib import Path
 
-PROJECT = r"C:\Users\Allure\WorkBuddy\2026-11-18-16-06-20\feiyu-cover"
+# 相对本文件定位项目根（cover_api/ 的上一级），避免写死某台机器的工作区路径
+PROJECT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, PROJECT)
 os.environ["FEIYU_COVER_DATA_DIR"] = tempfile.mkdtemp(prefix="feiyu-jobs-")
 os.environ.setdefault("FEIYU_COVER_API_KEY", "")
@@ -38,7 +40,7 @@ with TestClient(app) as client:
     check("GET /capabilities", r.status_code == 200 and "problems" in body,
           f"ready={body.get('ready')}")
 
-    r = client.post("/cover", json={"song": "晴天 周杰伦"})
+    r = client.post("/cover", json={"song": "大鱼 周深"})
     check("POST /cover 202", r.status_code == 202, r.text[:120])
     payload = r.json()
     job_id = payload.get("id", "")
@@ -62,6 +64,34 @@ with TestClient(app) as client:
 
     r = client.get("/jobs")
     check("GET /jobs", r.status_code == 200 and "jobs" in r.json())
+
+    r = client.get("/system/status")
+    check("GET /system/status", r.status_code == 200 and r.json().get("ok") is True and "rvc_worker" in r.json())
+
+    r = client.post("/system/unload")
+    check("POST /system/unload", r.status_code == 200 and r.json().get("ok") is True)
+
+    r = client.post("/jobs/deadbeef0000/cancel")
+    check("POST /jobs/{id}/cancel 不存在返回 404", r.status_code == 404)
+
+    r = client.post("/cover", json={"bvid": "BV1faak6AEzm", "preview_seconds": 60, "voice": {"auto_pitch": True, "f0_autotune": True, "vocal_reverb": True}})
+    check("POST /cover 新参数(bvid/preview/auto_pitch/autotune/reverb)", r.status_code == 202)
+
+    r = client.get("/studio")
+    check("GET /studio 独立上传页", r.status_code == 200 and "text/html" in r.headers.get("content-type", ""))
+
+    r = client.get("/studio/status")
+    body = r.json()
+    check("GET /studio/status", r.status_code == 200 and "task" in body and "datasets" in body)
+
+    r = client.post("/studio/cancel")
+    check("POST /studio/cancel 空闲返回 ok=False", r.status_code == 200 and r.json().get("ok") is False)
+
+    r = client.get("/jobs/deadbeef0000/highlight")
+    check("GET /jobs/{id}/highlight 不存在返回 404", r.status_code == 404)
+
+    r = client.post("/studio/inspect", json={"dataset": "/nonexistent/dataset_xyz"})
+    check("POST /studio/inspect 目录不存在返回 422", r.status_code == 422)
 
 print()
 print(f"通过 {len(ok)} 项，失败 {len(fail)} 项")

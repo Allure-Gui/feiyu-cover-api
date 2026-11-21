@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 250" width="920" height="250" fill="none">
+  <defs>
+    <filter id="cardShadow" x="-2%" y="-4%" width="104%" height="112%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#24344D" flood-opacity="0.08"/>
+    </filter>
+  </defs>
+
+  <!-- Canvas -->
+  <rect x="6" y="6" width="908" height="238" rx="22" fill="#FFFDF7" stroke="#24344D" stroke-width="2.5"/>
+  <rect x="13" y="13" width="894" height="224" rx="17" fill="none" stroke="#9EC5F8" stroke-width="1.4" stroke-dasharray="6 5"/>
+
+  <!-- Title -->
+  <text x="460" y="42" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Hiragino Sans GB',sans-serif" font-size="16" font-weight="700" fill="#24344D">
+    麦弦翻唱 API · 音频处理流水线（v0.3.0）
+  </text>
+
+  <!-- Stage 1 -->
+  <g transform="translate(26, 62)" filter="url(#cardShadow)">
+    <rect width="154" height="114" rx="15" fill="#F2F8FF" stroke="#24344D" stroke-width="2"/>
+    <text x="77" y="29" text-anchor="middle" font-size="18">🔎</text>
+    <text x="77" y="53" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="13.5" font-weight="700" fill="#24344D">多路并发检索</text>
+    <text x="77" y="75" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#526580">QQ / 网易云 / 酷狗</text>
+    <text x="77" y="94" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#3B7DD8" font-weight="700">+ B 站高质音源兜底</text>
+  </g>
+
+  <path d="M185 119 L201 119 M196 114 L202 119 L196 124" stroke="#F28B72" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Stage 2 -->
+  <g transform="translate(206, 62)" filter="url(#cardShadow)">
+    <rect width="158" height="114" rx="15" fill="#FFF7EE" stroke="#24344D" stroke-width="2"/>
+    <text x="79" y="29" text-anchor="middle" font-size="18">✂️</text>
+    <text x="79" y="53" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="13.5" font-weight="700" fill="#24344D">RoFormer 分离</text>
+    <text x="79" y="75" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#526580">SDR 12.6 dB 主唱分离</text>
+    <text x="79" y="94" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#D96B52" font-weight="700">二段提纯 · 60s 预切</text>
+  </g>
+
+  <path d="M369 119 L385 119 M380 114 L386 119 L380 124" stroke="#3B7DD8" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Stage 3 -->
+  <g transform="translate(390, 62)" filter="url(#cardShadow)">
+    <rect width="166" height="114" rx="15" fill="#F2FBF5" stroke="#24344D" stroke-width="2"/>
+    <text x="83" y="29" text-anchor="middle" font-size="18">🎵</text>
+    <text x="83" y="53" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="13.5" font-weight="700" fill="#24344D">按需常驻 RVC</text>
+    <text x="83" y="75" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#526580">spin-v2 / contentvec</text>
+    <text x="83" y="94" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#3B8E60" font-weight="700">智能变调 · 倍频折回</text>
+  </g>
+
+  <path d="M561 119 L577 119 M572 114 L578 119 L572 124" stroke="#E8B44C" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Stage 4 -->
+  <g transform="translate(582, 62)" filter="url(#cardShadow)">
+    <rect width="154" height="114" rx="15" fill="#FDF5FF" stroke="#24344D" stroke-width="2"/>
+    <text x="77" y="29" text-anchor="middle" font-size="18">🎚️</text>
+    <text x="77" y="53" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="13.5" font-weight="700" fill="#24344D">v10 母带混音</text>
+    <text x="77" y="75" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#526580">EBU R128 + 双级压缩</text>
+    <text x="77" y="94" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#7D52C7" font-weight="700">透明侧链 + 早期反射</text>
+  </g>
+
+  <path d="M741 119 L757 119 M752 114 L758 119 L752 124" stroke="#24344D" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Stage 5 -->
+  <g transform="translate(762, 62)" filter="url(#cardShadow)">
+    <rect width="132" height="114" rx="15" fill="#FFFBE8" stroke="#24344D" stroke-width="2"/>
+    <text x="66" y="29" text-anchor="middle" font-size="18">🎧</text>
+    <text x="66" y="53" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="13.5" font-weight="700" fill="#24344D">双母带输出</text>
+    <text x="66" y="75" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#526580">320k / 192k 立体声</text>
+    <text x="66" y="94" text-anchor="middle" font-family="'Microsoft YaHei',sans-serif" font-size="11" fill="#B57B14" font-weight="700">QQ SILK 稳态专调</text>
+  </g>
+
+  <!-- Bottom Highlight Strip -->
+  <rect x="26" y="192" width="868" height="34" rx="17" fill="#EBF4FF" stroke="#24344D" stroke-width="1.6"/>
+  <text x="460" y="213" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="700" fill="#24344D">
+    8GB 显存阶段隔离防 OOM   ·   空闲待机 0 MB 显存   ·   内置 /studio 干声提取与一键训练接口
+  </text>
+</svg>

@@ -3,4 +3,5 @@ config.json
 __pycache__/
 *.pyc
 .venv/
+runtime/
 qq-cookie.txt

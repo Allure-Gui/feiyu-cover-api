@@ -115,12 +115,13 @@ def clean(root: Path, cfg: dict[str, Any], skip_names: set[str] | None = None,
         for folder in folders[keep_jobs:]:
             try:
                 sz = _dir_size(folder)
-                shutil.rmtree(folder, ignore_errors=True)
+                shutil.rmtree(folder)
+                # 只有真删掉才计入统计，避免 WebUI 显示的释放量虚高
                 removed_jobs += 1
                 removed_job_ids.append(folder.name)
                 freed += sz
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("删除旧任务目录失败 %s: %s", folder.name, exc)
 
     if removed_job_ids and on_job_removed:
         with contextlib.suppress(Exception):
@@ -136,45 +137,44 @@ def clean(root: Path, cfg: dict[str, Any], skip_names: set[str] | None = None,
     return result
 
 
+def collect_skip_ids(manager) -> set[str]:
+    """收集不能清理的任务 id：正在运行的 + 排队中的。
+
+    定时清理与手动 /cache/clean 必须共用这套逻辑，否则手动强制清空可能
+    删掉排队任务的目录和 spec.json，导致任务状态损坏。
+    """
+    skip: set[str] = set()
+    active = getattr(manager, "_active", None)
+    if active:
+        skip.add(str(active))
+    queued = getattr(manager, "_queue", None)
+    if queued is not None:
+        for item in getattr(queued, "_queue", []) or []:
+            jid = getattr(item, "job_id", None) or (item if isinstance(item, str) else None)
+            if jid:
+                skip.add(str(jid))
+    return skip
+
+
 async def periodic(manager, cfg_getter, interval_hours: float) -> None:
-    """后台定时清理协程，随 app lifespan 启停。"""
+    """后台定时清理协程，随 app lifespan 启停。
+
+    interval_hours 是首次间隔；之后每轮从 cfg_getter 重读，
+    这样通过 /cache/config 改间隔无需重启。
+    """
     interval = max(1, int(interval_hours)) * 3600
     while True:
         await asyncio.sleep(interval)
         try:
-            # 跳过正在运行的任务目录（_active）与队列中的任务目录
-            skip = set()
-            active = getattr(manager, "_active", None)
-            if active:
-                skip.add(active)
-            queued = getattr(manager, "_queue", None)
-            if queued is not None:
-                for item in getattr(queued, "_queue", []) or []:
-                    jid = getattr(item, "job_id", None) or (item if isinstance(item, str) else None)
-                    if jid:
-                        skip.add(str(jid))
+            cfg = cfg_getter()
+            # 检查间隔也动态读取，/cache/config 改完下一轮即生效
+            interval = max(1, int(cfg.get("check_interval_hours", interval // 3600))) * 3600
             forget = getattr(manager, "forget_many", None)
-            clean(manager.root, cfg_getter(), skip_names=skip, on_job_removed=forget)
+            clean(manager.root, cfg, skip_names=collect_skip_ids(manager), on_job_removed=forget)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("定时清理失败: %s", exc)
-
-
-def clean_jobs_only(root: Path, keep: int, active_id: str | None = None) -> dict[str, Any]:
-    """兼容 jobs.cleanup 的按数量清理，跳过当前活动任务。"""
-    folders = sorted(
-        [p for p in root.iterdir() if p.is_dir() and p.name != "cache" and p.name != active_id],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    removed = 0
-    freed = 0
-    for folder in folders[keep:]:
-        freed += _dir_size(folder)
-        shutil.rmtree(folder, ignore_errors=True)
-        removed += 1
-    return {"removed_jobs": removed, "freed_mb": round(freed / 1024 / 1024, 1)}
 
 
 def clean_all(root: Path, skip_names: set[str] | None = None, on_job_removed=None) -> dict[str, Any]:
@@ -206,10 +206,14 @@ def clean_all(root: Path, skip_names: set[str] | None = None, on_job_removed=Non
                 continue
             # 只删看起来像 job_id 的目录（避免误删未知目录）
             if re.fullmatch(r"[0-9a-fA-F_-]{8,}", folder.name):
-                freed += _dir_size(folder)
-                shutil.rmtree(folder, ignore_errors=True)
-                removed_jobs += 1
-                removed_job_ids.append(folder.name)
+                try:
+                    sz = _dir_size(folder)
+                    shutil.rmtree(folder)
+                    freed += sz
+                    removed_jobs += 1
+                    removed_job_ids.append(folder.name)
+                except OSError as exc:
+                    logger.warning("删除旧任务目录失败 %s: %s", folder.name, exc)
     if removed_job_ids and on_job_removed:
         with contextlib.suppress(Exception):
             on_job_removed(removed_job_ids)
