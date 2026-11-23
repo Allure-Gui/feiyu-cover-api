@@ -7,7 +7,7 @@
   <p>面向 MaiBot 麦弦插件的本地 AI 翻唱与音色训练 HTTP 服务，集成多平台音源检索、Mel-Band RoFormer 人声分离、RVC 按需推理与母带混音。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/Version-v0.3.0-3B7DD8?style=for-the-badge&labelColor=24344D" alt="Version v0.3.0">
+    <img src="https://img.shields.io/badge/Version-v0.3.1-3B7DD8?style=for-the-badge&labelColor=24344D" alt="Version v0.3.1">
     <img src="https://img.shields.io/badge/Separator-Mel--Band%20RoFormer-E87A64?style=for-the-badge&labelColor=24344D" alt="RoFormer">
     <img src="https://img.shields.io/badge/RVC-spin--v2%20%2B%20RefineGAN-4FA374?style=for-the-badge&labelColor=24344D" alt="RefineGAN">
     <img src="https://img.shields.io/badge/VRAM-8GB%20%E5%8F%8B%E5%A5%BD%20%C2%B7%20%E7%A9%BA%E9%97%B20MB-E8B44C?style=for-the-badge&labelColor=24344D" alt="8GB VRAM">
@@ -58,6 +58,9 @@
 支持 **Windows 原生环境**、**Windows WSL2** 与 **Linux**。
 
 ### Windows（一键安装与启动）
+
+API `v0.3.1` 配套麦弦插件 `v0.2.1`。Windows 一键安装器随 API Release 的 **Source code (zip)** 分发。先安装 Python 3.10–3.12，首次安装时保持联网。解压后，插件的「API 文件夹路径」应指向同时包含两个 `.bat` 文件、`scripts/`、`cover_api/`、`requirements.txt` 和 `config.example.json` 的目录。`runtime/` 由安装器在本机生成。
+
 1. 前往 [Releases](https://github.com/Allure-Gui/feiyu-cover-api/releases) 下载最新版本源码包，解压至**纯英文路径**（例如 `D:\feiyu-cover-api`）。
 2. 双击根目录下的 **`一键安装与启动.bat`**，脚本将自动完成环境部署并启动服务（默认使用清华 PyPI 镜像，支持断点续装）：
    - 检测 NVIDIA GPU 环境（无独立显卡时自动回退至 CPU 模式）；
@@ -68,6 +71,13 @@
    - 在 MaiBot 麦弦插件设置页中将「API 文件夹路径」填写为该目录并开启「自动拉起本地服务」，即可由插件托管启停；
    - 浏览器访问 `http://127.0.0.1:19655/studio` 可上传音频提取干声，访问 `http://127.0.0.1:19655/models/import-page` 可拖拽导入外部模型；
    - 如需手动停止后台服务，请运行根目录下的 `停止服务.bat`。
+
+<details>
+<summary>维护者如何检查 Windows 源码包</summary>
+
+GitHub 按 API 标签对应的提交生成源码 ZIP。安装器从解压目录直接运行 `cover_api.app:app`。发布前在候选提交中用 `git ls-tree -r --name-only HEAD -- cover_api scripts` 核对新增模块，再用 `git archive --format=zip --prefix=feiyu-cover-api/ -o ../feiyu-cover-api-check.zip HEAD` 导出候选包。在新目录解压运行 `一键安装与启动.bat --check` 可核对 Python 和启动器。安装后请求 `GET /health` 核对服务版本 `0.3.1`。本版归档须包含 `cover_api/source_uploads.py`（上传）、`cover_api/render_cache.py`（渲染缓存）和 `cover_api/qq_recording.py`（QQ 原曲）。排除 `runtime/`、个人 `config.json`、Cookie、音频缓存及模型权重。未提交的文件不会进入标签源码包。
+
+</details>
 
 ### Linux / WSL2
 ```bash
@@ -129,6 +139,7 @@ bash install.sh
 | `POST` | `/models/upload` | 接收浏览器二进制上传的模型文件 |
 | `GET` | `/models/import-page` | 外部模型浏览器拖拽上传页 |
 | `GET` | `/sources/search` | 多平台并发搜歌 |
+| `POST` | `/sources/uploads` | 上传用于翻唱的本地音源 |
 | `POST` | `/cover` | 提交翻唱任务 |
 | `GET` | `/jobs` / `/jobs/{id}` | 查询任务列表与单任务进度 |
 | `POST` | `/jobs/{id}/cancel` | 中止排队或运行中的任务 |

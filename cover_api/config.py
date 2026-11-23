@@ -219,7 +219,9 @@ def validate(cfg: dict) -> list[str]:
     rvc = cfg.get("rvc", {})
     for key, label in (("python", "RVC python"), ("model", "RVC 模型 .pth"), ("index", "RVC 索引 .index")):
         value = rvc.get(key) or ""
-        if not value or not Path(value).exists():
+        if key == "index" and not value:
+            continue  # 无检索模型无需 FAISS 索引。
+        if not value or not Path(value).expanduser().is_file():
             problems.append(f"{label} 不存在: {value or '(未配置)'}")
     sep_python = (cfg.get("separate") or {}).get("python") or ""
     if sep_python and not Path(sep_python).exists():

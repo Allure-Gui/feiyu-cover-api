@@ -367,7 +367,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=19655, help="监听端口（默认 19655）")
     args = parser.parse_args()
 
-    banner("麦弦翻唱 API · 一键安装与启动 (v0.3.0)")
+    banner("麦弦翻唱 API · 一键安装与启动 (v0.3.1)")
     print(f"  系统环境：{platform.system()} {platform.release()} | Python {sys.version.split()[0]}")
     print(f"  安装目录：{ROOT}")
 

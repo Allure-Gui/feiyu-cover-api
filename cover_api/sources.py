@@ -24,6 +24,8 @@ import urllib.parse
 
 import httpx
 
+from . import qq_recording
+
 logger = logging.getLogger("cover.source")
 
 UA = (
@@ -574,8 +576,7 @@ def _qq_cookie(cfg: dict) -> str:
 
 
 def _qq_uin(cookie: str) -> str:
-    m = re.search(r"(?:^|;\s*)uin=o?(\d+)", cookie)
-    return m.group(1) if m else "0"
+    return qq_recording.account_id(cookie)
 
 
 def _search_qq(cfg: dict, keyword: str, limit: int = 6) -> list[dict[str, Any]]:
@@ -1107,11 +1108,13 @@ def _probe_audio_duration(path: Path, cfg: dict) -> float:
         return 0.0
 
 
-def download(url: str, dest: Path, cfg: dict) -> Path:
+def download(url: str, dest: Path, cfg: dict, *, qq_media: bool = False) -> Path:
     """下载音频到 dest（自动补扩展名，带短暂重试）。返回实际路径。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     headers = {"User-Agent": UA, "Referer": "https://music.txqq.pro/"}
-    if "bilibili" in url or "bilivideo" in url or "akamaized" in url:
+    if qq_media:
+        headers["Referer"] = "https://y.qq.com/"
+    elif "bilibili" in url or "bilivideo" in url or "akamaized" in url:
         headers["Referer"] = "https://www.bilibili.com/"
         headers["Origin"] = "https://www.bilibili.com"
         headers["Cookie"] = cfg.get("source", {}).get("bili_cookie") or f"buvid3={_BILI_BUVID};"
@@ -1133,7 +1136,7 @@ def download(url: str, dest: Path, cfg: dict) -> Path:
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True) as client:
+            with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=not qq_media) as client:
                 with client.stream("GET", url, headers=headers) as resp:
                     resp.raise_for_status()
                     ctype = (resp.headers.get("content-type") or "").lower()
@@ -1147,9 +1150,11 @@ def download(url: str, dest: Path, cfg: dict) -> Path:
         except (httpx.HTTPError, SourceError) as exc:
             last_exc = exc
             target.unlink(missing_ok=True)
-            if attempt == 0:
+            if attempt == 0 and not qq_media:
                 logger.debug("下载重试 %s: %s", url[:60], exc)
     if last_exc is not None:
+        if qq_media:
+            raise SourceError("QQ 授权媒体下载失败") from None
         raise SourceError(f"音频下载失败: {last_exc}") from last_exc
 
     if not target.exists() or target.stat().st_size < 64 * 1024:
@@ -1224,6 +1229,54 @@ def _try_download_candidate(
     return path, info
 
 
+def _resolve_qq_recording(selected: dict, cookie: str, cfg: dict, workdir: Path) -> tuple[Path, dict]:
+    mid = selected.get("songmid")
+    if not mid:
+        raise SourceError("所选 QQ 录音缺少 songmid，请重新选择")
+    try:
+        with httpx.Client(headers={"User-Agent": UA}) as client:
+            detail, rows = qq_recording.lookup(client, cookie, mid)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+        raise SourceError("所选 QQ 录音授权状态未知，请检查账号或稍后重试") from None
+
+    try:
+        expected = float(detail.get("interval") or 0)
+    except (TypeError, ValueError):
+        expected = 0
+    reasons = []
+    for row in rows:
+        code = row.get("result")
+        if code == 104003:
+            reason = "104003（此音质未获授权）"
+        elif type(code) is not int:
+            reason = "授权状态未知"
+        elif code != 0:
+            reason = f"其它返回码 {code}"
+        elif not row.get("url"):
+            reason = "返回码 0，媒体地址为空"
+        elif row.get("trial") is True:
+            reason = "仅提供试听片段"
+        elif not 0 < expected < float("inf"):
+            reason = "官方时长未知，无法核验完整录音"
+        else:
+            try:
+                path = download(row["url"], workdir / "input", cfg, qq_media=True)
+            except SourceError:
+                reason = "授权媒体下载失败"
+            else:
+                actual = _probe_audio_duration(path, cfg)
+                if 0 < actual < float("inf") and abs(actual - expected) <= min(3.0, expected * 0.05):
+                    return path, {"title": detail.get("title") or selected.get("title", ""),
+                                  "artist": selected.get("artist", ""), "album": selected.get("album", ""),
+                                  "origin": "qq", "origin_label": "QQ音乐", "songmid": mid,
+                                  "duration": actual, "quality": row.get("quality"), "qq_recording_locked": True,
+                                  "size_mb": round(path.stat().st_size / 1048576, 1)}
+                path.unlink(missing_ok=True)
+                reason = "下载时长与官方时长不符或无法核验"
+        reasons.append(f"{row.get('quality') or '未知音质'}：{reason}")
+    raise SourceError("所选 QQ 录音无可用完整版：" + ("；".join(reasons) or "授权状态未知"))
+
+
 def resolve(spec: dict, cfg: dict, workdir: Path) -> tuple[Path, dict[str, Any]]:
     """把任务描述解析成完整音频文件。
 
@@ -1241,6 +1294,8 @@ def resolve(spec: dict, cfg: dict, workdir: Path) -> tuple[Path, dict[str, Any]]
         path = Path(local).expanduser()
         if not path.is_file():
             raise SourceError(f"本地音频不存在: {path}")
+        if spec.get("upload_id"):
+            return path, {"title": spec.get("song") or "上传音频", "artist": "", "origin": "upload", "origin_label": "上传"}
         return path, {"title": path.stem, "artist": "", "origin": "local", "origin_label": "本地"}
 
     direct = spec.get("audio_url")
@@ -1250,6 +1305,12 @@ def resolve(spec: dict, cfg: dict, workdir: Path) -> tuple[Path, dict[str, Any]]
 
     # WebUI 点选的指定候选
     selected = spec.get("selected_track")
+    if ((cfg.get("source") or {}).get("qq_exact_recording") is True
+            and isinstance(selected, dict) and selected.get("origin") == "qq"
+            and int(spec.get("preview_seconds") or 0) <= 0):
+        cookie = _qq_cookie(cfg)
+        if cookie:
+            return _resolve_qq_recording(selected, cookie, cfg, workdir)
     if isinstance(selected, dict) and (selected.get("bvid") or selected.get("gd_id") or selected.get("songmid") or selected.get("url")):
         res = _try_download_candidate(selected, cfg, workdir)
         if res is not None:

@@ -30,6 +30,11 @@ from typing import Any
 logger = logging.getLogger("cover.rvc_worker")
 
 
+def _file_identity(path: Path) -> tuple[str, int, int]:
+    stat = path.stat()
+    return str(path.resolve()), stat.st_size, stat.st_mtime_ns
+
+
 # ============================================================================
 # 服务端进程池管理（运行在 service venv，不 import torch/faiss）
 # ============================================================================
@@ -43,6 +48,7 @@ class RvcWorkerPool:
         self._cwd: str = ""
         self._last_used: float = 0.0
         self._loaded_model: str = ""
+        self._loaded_model_identity: str | None = None
         self._idle_timeout: float = 180.0
         self._busy: bool = False
         self._stop_watchdog = threading.Event()
@@ -74,6 +80,7 @@ class RvcWorkerPool:
     def _reset_locked(self) -> None:
         self._proc = None
         self._loaded_model = ""
+        self._loaded_model_identity = None
         self._last_used = 0.0
 
     def _kill_locked(self, *, graceful: bool = True) -> None:
@@ -203,9 +210,14 @@ class RvcWorkerPool:
         log_path: Path | None = None,
     ) -> dict[str, Any]:
         """在常驻 worker 内执行一次 RVC 换声。"""
+        requested_model = Path(str(req.get("model") or ""))
+        requested_identity = req.get("asset_identity") or str(_file_identity(requested_model))
         with self._lock:
             self._idle_timeout = float(rvc_cfg.get("idle_unload_seconds", 180))
             proc = self._start_locked(rvc_cfg)
+            if self._loaded_model_identity is not None and self._loaded_model_identity != requested_identity:
+                self._kill_locked(graceful=True)
+                proc = self._start_locked(rvc_cfg)
             self._busy = True
 
         started = time.time()
@@ -243,6 +255,7 @@ class RvcWorkerPool:
             with self._lock:
                 self._last_used = time.time()
                 self._loaded_model = str(req.get("model") or "")
+                self._loaded_model_identity = requested_identity
             logger.info(
                 "RVC worker 完成，耗时 %.1fs（effective_pitch=%s, trimmed=%.1fs）",
                 time.time() - started,
@@ -637,8 +650,11 @@ def _serve_main() -> None:
             # timbre=1.0 时仅改 quefrency 不会偏移共振峰，反而白白引入相位毛刺与 4 倍耗时。
             effective_formant = formant_shifting and abs(formant_timbre - 1.0) >= 0.01
 
-            # 1. 加载/复用 RVC 模型与特征编码器（优先读取权重内置 embedder_model，兼容 spin-v2 与旧 contentvec 无缝切换）
-            vc.get_vc(model_path, 0)
+            # Refresh Applio's in-memory weights when a model is replaced in-place.
+            model_identity = _file_identity(Path(model_path))
+            if getattr(vc, "_feiyu_model_identity", None) != model_identity:
+                vc.get_vc(model_path, 0)
+                vc._feiyu_model_identity = model_identity
             cpt_embedder = str((vc.cpt or {}).get("embedder_model") or "").strip()
             if cpt_embedder:
                 resolved_embedder = cpt_embedder
@@ -722,12 +738,15 @@ def _serve_main() -> None:
                     rmv_obj.get_f0 = _smooth_get_f0
                     rmv_obj._feiyu_despiked = True
 
-            # 5. 执行推理（复用缓存的 FAISS index，避免反复读盘）
-            file_index = index_path.strip().strip('"').replace("trained", "added")
-            # 临时把 faiss.read_index 指向缓存命中（零入侵 Applio 源码）
-            import faiss as _faiss_mod
-            orig_read = _faiss_mod.read_index
-            if file_index and os.path.isfile(file_index) and index_rate > 0:
+            # 5. Execute inference with only the explicitly selected index.
+            file_index = index_path.strip().strip('"')
+            if not file_index or not os.path.isfile(file_index):
+                file_index = ""
+                index_rate = 0.0
+            orig_read = None
+            if file_index and index_rate > 0:
+                import faiss as _faiss_mod
+                orig_read = _faiss_mod.read_index
                 cached_idx, _ = _get_cached_index(file_index)
                 if cached_idx is not None:
                     _faiss_mod.read_index = lambda p, _c=cached_idx, _fp=file_index: (
@@ -753,7 +772,8 @@ def _serve_main() -> None:
                     proposed_pitch_threshold=155.0,
                 )
             finally:
-                _faiss_mod.read_index = orig_read
+                if orig_read is not None:
+                    _faiss_mod.read_index = orig_read
 
             # 6. 按采样率比例补回首尾精确静音，保证与伴奏严格毫秒级对齐
             if lead_16k > 0 or tail_16k > 0:

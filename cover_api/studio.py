@@ -677,9 +677,14 @@ class StudioManager:
         ffprobe = (self.cfg.get("mix") or {}).get("ffprobe", "ffprobe")
         ffmpeg = (self.cfg.get("mix") or {}).get("ffmpeg", "ffmpeg")
 
-        total_dur = 0.0
-        for f in files:
-            total_dur += _probe_duration(f, ffprobe)
+        import math
+
+        durations = [_probe_duration(f, ffprobe) for f in files]
+        durations = [d if math.isfinite(d) and d > 0 else 0.0 for d in durations]
+        total_dur = sum(durations)
+        count = min(24, len(files))
+        indices = [i * (len(files) - 1) // max(1, count - 1) for i in range(count)]
+        plan = [(str(files[i]), durations[i]) for i in indices]
         total_min = round(total_dur / 60.0, 1)
 
         # 用 RVC 虚拟环境的 numpy 做高速向量化声学体检（纯 CPU，不碰显存，20 首歌仅 ~1.5 秒）
@@ -689,7 +694,9 @@ class StudioManager:
             probe_code = r"""
 import json, pathlib, subprocess, sys, numpy as np
 ffmpeg = sys.argv[1]
-files = [pathlib.Path(p) for p in sys.argv[2:26]]
+plan = json.load(sys.stdin)
+sampled = segments = attempted = 0
+failed = []
 sr = 16000
 total_frames = 0
 active_frames = 0
@@ -698,17 +705,35 @@ f0_vals = []
 # 自相关范围对应 80Hz ~ 850Hz
 lag_min = sr // 850
 lag_max = sr // 80
-for f in files:
-    proc = subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-t", "120", "-i", str(f),
-         "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
-        capture_output=True, timeout=30, check=False,
-    )
-    if proc.returncode != 0 or len(proc.stdout) < sr * 4:
+for path, duration in plan:
+    f = pathlib.Path(path)
+    width = min(8.0, duration / 3) if duration >= 3 else duration or 8.0
+    span = max(0.0, duration - width)
+    starts = sorted({0.0, span / 2, span})
+    chunks = []
+    for start in starts:
+        attempted += 1
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-nostdin", "-xerror", "-v", "error", "-ss", str(start), "-i", path,
+                 "-t", str(width), "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+                capture_output=True, timeout=8, check=False,
+            )
+            if proc.returncode or len(proc.stdout) % 4:
+                continue
+            chunk = np.frombuffer(proc.stdout, dtype="<f4")
+            if len(chunk) < max(sr // 20, int(width * sr * 0.9) if duration else 0) or not np.isfinite(chunk).all():
+                continue
+            chunks.append(chunk)
+            segments += 1
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    if len(chunks) < len(starts):
+        failed.append(f.name)
+    if not chunks:
         continue
-    x = np.frombuffer(proc.stdout[: (len(proc.stdout) // 4) * 4], dtype=np.float32)
-    if len(x) < sr:
-        continue
+    sampled += 1
+    x = np.concatenate(chunks)
     # 爆音检测：连续满幅削波点比例
     clip_cnt = int(np.sum(np.abs(x) >= 0.992))
     if clip_cnt > max(64, int(len(x) * 0.0008)):
@@ -746,22 +771,20 @@ for f in files:
             if 75.0 <= hz <= 820.0:
                 f0_vals.append(hz)
 
-silence_pct = round((1.0 - (active_frames / max(1, total_frames))) * 100.0, 1) if total_frames else 0.0
-active_min_ratio = (active_frames / max(1, total_frames)) if total_frames else 1.0
 out = {
-    "silence_pct": silence_pct,
-    "active_ratio": round(active_min_ratio, 3),
-    "clipped_files": clipped_files[:8],
+    "sampled": sampled, "segments": segments, "attempted": attempted, "failed": failed,
+    "frames": total_frames, "active": active_frames,
+    "clipped_files": clipped_files,
     "f0_count": len(f0_vals),
     "f0_median": round(float(np.median(f0_vals)), 1) if f0_vals else 0.0,
     "f0_p95": round(float(np.percentile(f0_vals, 95)), 1) if f0_vals else 0.0,
     "high_450_pct": round(float(np.mean(np.array(f0_vals) >= 450.0) * 100.0), 1) if f0_vals else 0.0,
 }
-print(json.dumps(out, ensure_ascii=False))
+print(json.dumps(out))
 """
             try:
                 proc = subprocess.run(
-                    [str(rvc_py), "-c", probe_code, ffmpeg, *[str(f) for f in files[:24]]],
+                    [str(rvc_py), "-c", probe_code, ffmpeg], input=json.dumps(plan),
                     capture_output=True, text=True, errors="replace", timeout=45, check=False,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
@@ -769,17 +792,37 @@ print(json.dumps(out, ensure_ascii=False))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("声纹体检 numpy 探测异常，降级为基础体检：%s", exc)
 
-        active_ratio = float(metrics.get("active_ratio", 1.0))
-        active_min = round(total_min * active_ratio, 1)
-        silence_pct = float(metrics.get("silence_pct", 0.0))
+        if not isinstance(metrics, dict):
+            metrics = {}
+        frames = metrics.get("frames", 0)
+        active = metrics.get("active", 0)
+        sampled = metrics.get("sampled", 0)
+        missing_duration = durations.count(0.0)
+        segments = metrics.get("segments", 0)
+        attempted = metrics.get("attempted", 0)
+        measured = bool(frames and sampled and segments)
+        incomplete = sampled != count or segments != attempted or bool(missing_duration)
+        active_ratio = active / frames if measured else 0.0
+        active_min = round(total_dur * active_ratio / 60.0, 1)
+        silence_pct = round((1.0 - active_ratio) * 100.0, 1)
         clipped = list(metrics.get("clipped_files") or [])
         f0_med = float(metrics.get("f0_median", 0.0))
         f0_p95 = float(metrics.get("f0_p95", 0.0))
         high_pct = float(metrics.get("high_450_pct", 0.0))
 
         checks: list[dict[str, str]] = []
+        failed_names = (metrics.get("failed") or [])[:3]
+        coverage = (f"素材 {len(files)} 首，跨目录内文件均匀选取 {count} 首；成功读取 {sampled} 首，"
+                    f"首/中/尾片段成功 {segments}/{attempted}（短音频整段）；时长未知 {missing_duration} 首。")
+        if failed_names:
+            coverage += " 未完整读取：" + "、".join(failed_names)
+        checks.append({"key": "coverage", "level": "bad" if not measured else "warn" if incomplete else "ok",
+                       "title": "抽样覆盖" if measured else "未取得可分析音频帧", "detail": coverage})
         # 1. 有效时长
-        if active_min < 8.0:
+        if not measured:
+            checks.append({"key": "duration", "level": "bad", "title": "无法估算有效时长",
+                           "detail": "请检查音频能否解码，以及 RVC Python、numpy 和 ffmpeg 配置。"})
+        elif active_min < 8.0:
             checks.append({"key": "duration", "level": "bad", "title": f"有效干声偏短（{active_min} 分钟）",
                            "detail": f"共 {len(files)} 首 / 总长 {total_min} 分钟；建议补到 15~40 分钟避免过拟合"})
         elif active_min < 18.0:
@@ -793,8 +836,11 @@ print(json.dumps(out, ensure_ascii=False))
                            "detail": "精选 30~50 分钟最干净的干声，往往比堆太多杂音素材音质更好"})
 
         # 2. 静音与间奏占比
-        if metrics:
-            if silence_pct >= 38.0:
+        if measured:
+            if not active:
+                checks.append({"key": "silence", "level": "bad", "title": "抽样片段全部静音或低于有效电平",
+                               "detail": "请试听原素材并检查录音电平后重新体检。"})
+            elif silence_pct >= 38.0:
                 checks.append({"key": "silence", "level": "warn", "title": f"静音/间奏偏多（占 {silence_pct}%）",
                                "detail": "建议点下方「一键静音清洗」裁掉长间奏空白与底噪，减少无效切片"})
             else:
@@ -805,9 +851,9 @@ print(json.dumps(out, ensure_ascii=False))
         if clipped:
             checks.append({"key": "clipping", "level": "bad", "title": f"发现 {len(clipped)} 首疑似爆音削波",
                            "detail": f"涉及：{', '.join(clipped[:3])}{' 等' if len(clipped) > 3 else ''}，建议剔除或重提取"})
-        elif metrics:
-            checks.append({"key": "clipping", "level": "ok", "title": "无爆音削波失真",
-                           "detail": "电平峰值健康，适合直接切分训练"})
+        elif measured and active:
+            checks.append({"key": "clipping", "level": "ok", "title": "抽样片段未发现爆音削波",
+                           "detail": "已读取的片段未达到削波阈值。"})
 
         # 4. 高音覆盖（450Hz+）
         if f0_med > 0:
@@ -825,6 +871,15 @@ print(json.dumps(out, ensure_ascii=False))
                                "title": f"男声中低音域清晰（中心 {f0_med}Hz）",
                                "detail": f"高音 p95≈{f0_p95}Hz，声线范围分布自然"})
 
+        for key, label in (("silence", "静音比例"), ("clipping", "削波"), ("high_notes", "音域")):
+            if not any(c["key"] == key for c in checks):
+                checks.append({"key": key, "level": "warn", "title": f"无法判断{label}",
+                               "detail": "抽样中没有足够的可分析信号。"})
+        if incomplete and measured:
+            for check in checks:
+                if check["level"] == "ok":
+                    check.update(level="warn", title="仅部分样本：" + check["title"],
+                                 detail="采样不完整，本项不能代表整个素材集。")
         levels = [c["level"] for c in checks]
         overall = "bad" if "bad" in levels else ("warn" if "warn" in levels else "ok")
         summary_map = {
@@ -840,7 +895,8 @@ print(json.dumps(out, ensure_ascii=False))
             "total_min": total_min,
             "active_min": active_min,
             "overall": overall,
-            "summary": summary_map[overall],
+            "summary": ("部分素材或片段读取失败，请核对抽样覆盖后重新体检。"
+                        if overall == "warn" and incomplete else summary_map[overall]),
             "checks": checks,
         }
 

@@ -42,6 +42,7 @@ from . import config as config_module
 from . import cleanup as cleanup_module
 from . import pipeline, rvc_worker, sources as sources_module, studio as studio_module
 from .jobs import JobManager
+from .source_uploads import UploadStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cover.api")
 
-VERSION = "0.3.0"
+from . import __version__ as VERSION
 CFG = config_module.load_config()
 STUDIO = studio_module.StudioManager(CFG)
 
@@ -83,6 +84,7 @@ class CoverRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     song: str | None = Field(default=None, description="歌曲名、关键词、BV 号或音频链接")
+    upload_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     audio_url: str | None = Field(default=None, description="音频直链")
     audio_path: str | None = Field(default=None, description="本地音频绝对路径")
     bvid: str | None = Field(default=None, description="指定 B 站视频 BV 号")
@@ -99,6 +101,10 @@ class CoverRequest(BaseModel):
 
     @model_validator(mode="after")
     def _need_source(self):
+        if self.upload_id:
+            if any(value is not None for value in (self.audio_url, self.audio_path, self.bvid, self.selected_track)):
+                raise ValueError("upload_id 不能与其他音源同时使用")
+            return self
         if not (self.song or self.audio_url or self.audio_path or self.bvid or self.selected_track):
             raise ValueError("song / audio_url / audio_path / bvid 至少提供一个")
         return self
@@ -106,6 +112,7 @@ class CoverRequest(BaseModel):
 
 # ---------------------------------------------------------------- 应用
 manager = JobManager(CFG, pipeline.runner)
+UPLOADS = UploadStore(manager)
 
 
 @asynccontextmanager
@@ -135,9 +142,13 @@ async def lifespan(_: FastAPI):
             cleanup_module.periodic(manager, lambda: CFG.get("cleanup") or {},
                                     cleanup_cfg.get("check_interval_hours", 24))
         )
+    uploads_task = asyncio.create_task(UPLOADS.periodic())
     try:
         yield
     finally:
+        uploads_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await uploads_task
         if cleanup_task is not None:
             cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -239,6 +250,14 @@ def system_unload() -> dict[str, Any]:
     }
 
 
+@app.post("/sources/uploads", dependencies=[Depends(_auth)])
+async def upload_source(request: Request) -> dict[str, str]:
+    try:
+        return await asyncio.wait_for(UPLOADS.receive(request, CFG['mix'].get('ffprobe', 'ffprobe')), 180)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(408, '上传超时') from exc
+
+
 @app.get("/sources/search", dependencies=[Depends(_auth)])
 def sources_search(keyword: str, limit: int = 8, source_hint: str = "auto") -> dict[str, Any]:
     """多平台音源搜索预览，供 WebUI 选歌与排查。"""
@@ -263,6 +282,7 @@ def cache_stats() -> dict[str, Any]:
     try:
         return {
             "ok": True,
+            "force_preserves_jobs": True,
             "cache_mb": round(cleanup_module._dir_size(root / "cache") / 1024 / 1024, 1),
             "config": {
                 "enabled": (CFG.get("cleanup") or {}).get("enabled", True),
@@ -509,7 +529,7 @@ async def list_models() -> dict[str, Any]:
 
     # 当前默认为第一项
     default_model = Path(rvc["model"]).expanduser()
-    default_index = Path(rvc["index"]).expanduser()
+    default_index = str(Path(rvc["index"]).expanduser()) if rvc.get("index") else ""
     items.append({
         "id": "default",
         "label": "默认（原版声库）",
@@ -658,7 +678,7 @@ def create_cover(req: CoverRequest) -> JSONResponse:
         raise HTTPException(409, "干声工坊正在占用显卡（分离或训练中），请等待完成或先停止工坊任务")
     spec = req.model_dump()
     try:
-        job = manager.submit(spec)
+        job = UPLOADS.submit(spec) if req.upload_id else manager.submit(spec)
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
     payload = job.to_dict()

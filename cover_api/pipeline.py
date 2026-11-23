@@ -27,6 +27,7 @@ from typing import Any
 
 from . import rvc_worker, sources
 from .jobs import Job, JobCancelled, JobManager
+from .render_cache import dry_cache_key, final_cache_key
 
 logger = logging.getLogger("cover.pipeline")
 
@@ -41,16 +42,7 @@ def shutdown() -> None:
 
 
 # ---------------------------------------------------------------- 工具
-def _sha256_file(path: Path, limit_mb: int = 64) -> str:
-    digest = hashlib.sha256()
-    read = 0
-    with path.open("rb") as handle:
-        while block := handle.read(1024 * 1024):
-            digest.update(block)
-            read += len(block)
-            if read > limit_mb * 1024 * 1024:
-                break
-    return digest.hexdigest()
+from .render_cache import file_digest as _sha256_file, restore_render, store_render, select_assets
 
 
 def _make_nice_fn(nice_val: int):
@@ -531,6 +523,14 @@ def run(job: Job, mgr: JobManager) -> None:
     step("downloading", 0.12, f"已获取音频（{duration:.0f}s · {info.get('origin_label') or info.get('origin') or ''}）")
 
     preview_seconds = int(job.spec.get("preview_seconds") or 0)
+    selected = job.spec.get("selected_track") or {}
+    if not preview_seconds and selected:
+        try:
+            expected = float(selected.get("duration") or 0)
+        except (ValueError, TypeError):
+            expected = 0
+        if expected > 0 and 0 < duration < expected - max(15, expected * 0.15):
+            raise PipelineError(f"所选版本标注 {expected:.0f} 秒，音源实际仅 {duration:.0f} 秒。请换一个完整音源后再生成整曲。")
     full_audio_sha = _sha256_file(audio)
     cache_root = mgr.root / "cache"
     sep_cfg = cfg.get("separate") or {}
@@ -608,16 +608,15 @@ def run(job: Job, mgr: JobManager) -> None:
 
     vocal_db = _mean_volume(cfg, vocals)
     vocal_dur = _probe_duration(vocals, cfg["mix"].get("ffprobe", "ffprobe")) or 0.0
-    active_ratio = _vocal_active_ratio(cfg, vocals, vocal_dur, threshold_db=min_vocal_db)
-
-    if active_ratio is not None and active_ratio < min_ratio:
-        raise PipelineError(
-            f"《{title}》没有可用人声（有效人声只占 {active_ratio*100:.0f}% 的时长，"
-            f"低于 {min_ratio*100:.0f}%），多半是伴奏版或纯音乐版。"
-            f"换个版本，或者自己上传带人声的音频。"
-        )
-    if active_ratio is not None:
-        logger.info("人声有效性：占比 %.0f%%（平均 %.1f dB），通过", active_ratio * 100, vocal_db or 0)
+    activity = _vocal_activity(cfg, vocals, vocal_dur, threshold_db=min_vocal_db)
+    if activity is not None:
+        active_ratio, longest = activity
+        if _reject_vocal_activity(activity, min_ratio):
+            raise PipelineError(
+                f"《{title}》没有可用人声（活动占比 {active_ratio:.0%}，最长连续 {longest:.1f} 秒），"
+                f"多半是伴奏版或纯音乐版。换个版本，或者自己上传带人声的音频。"
+            )
+        logger.info("人声有效性：占比 %.0f%%，最长连续 %.1f 秒，通过", active_ratio * 100, longest)
 
     # ---- 2.55 干声质量自动救场：仅当音乐平台源疑似劣质翻录/干声严重偏弱（<-24dB）时，优先尝试 B 站单人翻唱候选（绝不拒单） ----
     is_pinned = bool(
@@ -669,10 +668,10 @@ def run(job: Job, mgr: JobManager) -> None:
                         shutil.copyfile(bv_raw, b_voc)
                         shutil.copyfile(bi_raw, b_ins)
                     b_vdb = _mean_volume(cfg, b_voc)
-                    b_ar = _vocal_active_ratio(cfg, b_voc, b_dur, threshold_db=min_vocal_db)
+                    b_activity = _vocal_activity(cfg, b_voc, b_dur, threshold_db=min_vocal_db)
                     if (
                         b_vdb is not None
-                        and (b_ar is None or b_ar >= min_ratio)
+                        and not _reject_vocal_activity(b_activity, min_ratio)
                         and b_vdb > vocal_db + 2.0
                     ):
                         logger.info("已自动切换至 B 站单人翻唱《%s》（干声 %.1f → %.1f dB）",
@@ -752,50 +751,58 @@ def run(job: Job, mgr: JobManager) -> None:
     air_db = float(voice.get("vocal_air_db", mix_cfg.get("vocal_air_db", 1.5)))
     reverb_on = bool(voice.get("vocal_reverb", mix_cfg.get("vocal_reverb", True)))
 
-    model_path = Path(rvc_cfg["model"]).expanduser()
-    index_path = Path(rvc_cfg["index"]).expanduser()
-    if model_override:
-        model_path = Path(model_override)
-        if not model_path.is_file():
-            raise PipelineError(f"指定的模型不存在：{model_override}")
-    if index_override:
-        index_path = Path(index_override)
-        if not index_path.is_file():
-            raise PipelineError(f"指定的索引不存在：{index_override}")
-    if not model_path.is_file():
-        raise PipelineError(f"RVC 模型不存在: {model_path}")
-    if not index_path.is_file():
-        raise PipelineError(f"RVC 索引不存在: {index_path}")
-
-    model_tag = _sha256_file(model_path)[:8]
+    try:
+        model_path, index_file = select_assets(rvc_cfg, voice)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
+    index_path = str(index_file or "")
+    if not index_path:
+        index_rate = 0.0
+    embedder_model = _detect_model_embedder(model_path)
+    profile = model_path.with_name("f0_profile.json")
+    model_tag = _hash_json([_sha256_file(model_path),
+                            _sha256_file(profile) if profile.is_file() else None,
+                            embedder_model])
     final_cache = cache_root / "final"
     out_format = (mix_cfg.get("out_format") or "mp3").lower()
-    mix_tag = _hash_json(mix_cfg)[:8]
-    source_tag = _hash_json(cfg.get("source") or {})[:8]
-    # v10: 黄金人声/伴奏配平(V-I≈+4dB) + 温和透明侧链闪避(-1.3dB) + 录音棚串联双压 + 非对称立体声早反射
-    logic_tag = "v10"
-    cached = final_cache / (
-        f"{audio_sha}_{sep_sig}_p{pitch}_ap{int(auto_pitch)}_ir{index_rate}_pr{protect}_ve{volume_envelope}"
-        f"_{f0_method}_at{int(f0_autotune)}{f0_autotune_strength}"
-        f"_f{int(formant_shifting)}{formant_qfrency}_{formant_timbre}"
-        f"_eq{int(eq_on)}{presence_db}_{air_db}_rv{int(reverb_on)}"
-        f"_pv{preview_seconds}_m{mix_tag}_s{source_tag}_{model_tag}_{logic_tag}.{out_format}"
-    )
+    resolved_emb = embedder_model
+    index_digest = _sha256_file(index_file) if index_file else "no-index"
+    rvc_settings = {
+        "trim_silence": bool(rvc_cfg.get("trim_silence", True)),
+        "auto_pitch_threshold_hz": float(rvc_cfg.get("auto_pitch_threshold_hz", 165.0)),
+        "pitch": pitch, "auto_pitch": auto_pitch, "index_rate": index_rate,
+        "protect": protect, "volume_envelope": volume_envelope, "f0_method": f0_method,
+        "f0_autotune": f0_autotune, "f0_autotune_strength": f0_autotune_strength,
+        "formant_shifting": formant_shifting, "formant_qfrency": formant_qfrency,
+        "formant_timbre": formant_timbre,
+    }
+    dry_key = dry_cache_key(audio_sha, _sha256_file(work_vocals), model_tag,
+                            index_digest, resolved_emb, rvc_settings)
+    dry_cache = cache_root / "rvc" / f"{dry_key}.zip"
+    final_settings = {"mix": mix_cfg, "eq_on": eq_on, "presence_db": presence_db,
+                      "air_db": air_db, "reverb_on": reverb_on, "format": out_format}
+    final_key = final_cache_key(dry_key, _sha256_file(work_inst), final_settings)
+    cached = final_cache / f"{final_key}.zip"
 
     output = workdir / f"cover.{out_format}"
     effective_pitch = pitch
-    if cached.is_file():
+    render_meta = restore_render(cached, output)
+    if render_meta is not None:
         step("converting", 0.9, "复用已缓存的翻唱成品")
-        job.meta["cache_hit"] = True
+        effective_pitch = render_meta["effective_pitch"]
+        job.meta.update(render_meta, cache_hit=True)
         mgr.update(job, meta=job.meta)
-        shutil.copyfile(cached, output)
     else:
         mode_tip = f"（{preview_seconds}s 极速试听）" if preview_seconds > 0 else ""
         step("converting", 0.45, f"RVC 换声处理中{mode_tip}（GPU）")
         rvc_out = workdir / "rvc_vocals.wav"
+        dry_meta = restore_render(dry_cache, rvc_out, name="dry")
+        inference_done = dry_meta is not None
+        if dry_meta:
+            effective_pitch = int(dry_meta["effective_pitch"])
+            job.meta.update(dry_meta)
 
-        used_worker = False
-        if rvc_cfg.get("use_worker", True):
+        if not inference_done and rvc_cfg.get("use_worker", True):
             mgr.set_cancel_hook(job.id, lambda: rvc_worker.POOL.cancel_active())
             try:
                 w_resp = rvc_worker.POOL.infer(
@@ -813,7 +820,8 @@ def run(job: Job, mgr: JobManager) -> None:
                         "formant_shifting": formant_shifting,
                         "formant_qfrency": formant_qfrency,
                         "formant_timbre": formant_timbre,
-                        "embedder_model": "auto",
+                        "embedder_model": resolved_emb,
+                        "asset_identity": model_tag,
                         "f0_autotune": f0_autotune,
                         "f0_autotune_strength": f0_autotune_strength,
                         "trim_silence": bool(rvc_cfg.get("trim_silence", True)),
@@ -823,7 +831,7 @@ def run(job: Job, mgr: JobManager) -> None:
                     timeout=int(rvc_cfg.get("timeout", 1800)),
                     log_path=log_path,
                 )
-                used_worker = True
+                inference_done = True
                 if w_resp.get("effective_pitch") is not None:
                     effective_pitch = int(w_resp["effective_pitch"])
                 job.meta["effective_pitch"] = effective_pitch
@@ -845,21 +853,26 @@ def run(job: Job, mgr: JobManager) -> None:
             finally:
                 mgr.set_cancel_hook(job.id, None)
 
-        if not used_worker:
+        if not inference_done:
             effective_formant = formant_shifting and abs(formant_timbre - 1.0) >= 0.01
             autotune_flag = f"--f0-autotune --f0-autotune-strength {f0_autotune_strength}" if f0_autotune else ""
-            detected_embedder = _detect_model_embedder(model_path)
+            detected_embedder = resolved_emb
+            job.meta["embedder_model"] = detected_embedder
             cmd_tpl = rvc_cfg["command"]
             if "{embedder_model}" not in cmd_tpl and detected_embedder != "contentvec":
                 cmd_tpl = cmd_tpl.replace("--embedder-model contentvec", f"--embedder-model {detected_embedder}")
+            cli_index_rate = index_rate if index_path else 0.0
+            cli_index = index_path
+            if not index_path:
+                cli_index = ""
             fmt_kwargs = dict(
                 python=rvc_cfg["python"],
                 input=str(work_vocals),
                 output=str(rvc_out),
                 model=str(model_path),
-                index=str(index_path),
+                index=cli_index,
                 pitch=pitch,
-                index_rate=index_rate,
+                index_rate=cli_index_rate,
                 protect=protect,
                 volume_envelope=volume_envelope,
                 f0_method=f0_method,
@@ -893,6 +906,22 @@ def run(job: Job, mgr: JobManager) -> None:
         mgr.check_cancelled(job.id)
         if not rvc_out.is_file():
             raise PipelineError("RVC 未产出音频文件")
+        if not dry_meta:
+            job.meta["effective_pitch"] = effective_pitch
+            job.meta["inst_pitch"] = _minimal_inst_shift(effective_pitch)
+            dry_meta = {
+                key: job.meta[key] for key in (
+                    "effective_pitch", "inst_pitch", "detected_f0_hz", "detected_f0_p95_hz",
+                    "model_f0_profile", "trimmed_seconds", "embedder_model",
+                ) if key in job.meta
+            }
+            # A transient worker failure runs a different backend with different pitch logic.
+            cacheable = inference_done or not rvc_cfg.get("use_worker", True)
+            if cacheable:
+                store_render(dry_cache, rvc_out, dry_meta, name="dry")
+        else:
+            cacheable = True
+            job.meta["rvc_cache_hit"] = True
         step("converting", 0.76, "换声完成")
 
         # ---- 4. 混音 ----
@@ -906,17 +935,15 @@ def run(job: Job, mgr: JobManager) -> None:
             with contextlib.suppress(Exception):
                 _make_voice_clip(cfg, output, output.parent / "cover_voice.mp3", log_path)
 
-        final_cache.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copyfile(output, cached)
-        except OSError as exc:
-            logger.warning("写缓存失败: %s", exc)
+        if cacheable:
+            store_render(cached, output, dry_meta)
 
     # ---- 5. 收尾 ----
     # 顺手保留一份轻量化纯人声轨，供「麦麦清唱猜歌」秒出 15 秒无伴奏片段
-    vocals_cache = cached.with_suffix(".vocals.mp3")
     vocals_out = workdir / "rvc_vocals.mp3"
     rvc_wav = workdir / "rvc_vocals.wav"
+    if render_meta is not None:
+        restore_render(dry_cache, rvc_wav, name="dry")
     if rvc_wav.is_file():
         with contextlib.suppress(Exception):
             _run(
@@ -927,12 +954,6 @@ def run(job: Job, mgr: JobManager) -> None:
                 cwd=None, timeout=90, log_path=log_path,
                 nice_val=int(mix_cfg.get("nice", 10)),
             )
-            if vocals_out.is_file():
-                final_cache.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(vocals_out, vocals_cache)
-    elif vocals_cache.is_file() and not vocals_out.is_file():
-        with contextlib.suppress(OSError):
-            shutil.copyfile(vocals_cache, vocals_out)
 
     duration_val = round(_probe_duration(output, mix_cfg.get("ffprobe", "ffprobe")), 1)
     chorus_src = work_vocals if work_vocals.is_file() else output
@@ -1047,9 +1068,17 @@ def detect_chorus_start(
     return round(min(chosen, max(0.0, dur - clip_sec)), 1)
 
 
-def _vocal_active_ratio(cfg: dict, path: Path, duration: float,
-                        threshold_db: float = -45.0) -> float | None:
-    if not duration or duration <= 0:
+def _reject_vocal_activity(activity: tuple[float, float] | None, min_ratio: float) -> bool:
+    if activity is None:
+        return False
+    ratio, longest = activity
+    return ratio < min(0.1, min_ratio) or (ratio < min_ratio and longest < 3.0)
+
+
+def _vocal_activity(cfg: dict, path: Path, duration: float,
+                    threshold_db: float = -45.0) -> tuple[float, float] | None:
+    """一次 silencedetect 同时取得活动占比和最长连续活动秒数。"""
+    if not 0 < duration < float("inf"):
         return None
     ffmpeg = cfg["mix"].get("ffmpeg", "ffmpeg")
     try:
@@ -1062,11 +1091,33 @@ def _vocal_active_ratio(cfg: dict, path: Path, duration: float,
         logger.warning("人声活跃度探测失败，跳过纯伴奏拦截：%s", exc)
         return None
 
-    silence = 0.0
-    for m in re.finditer(r"silence_duration: ([0-9.]+)", proc.stderr or ""):
-        silence += float(m.group(1))
-    silence = min(silence, duration)
-    return max(0.0, (duration - silence) / duration)
+    if proc.returncode != 0:
+        logger.warning("人声活跃度探测退出码 %d，跳过纯伴奏拦截", proc.returncode)
+        return None
+
+    active = longest = cursor = 0.0
+    silent = False
+    for kind, raw in re.findall(r"\bsilence_(start|end):\s*(\S+)", proc.stderr or ""):
+        try:
+            stamp = float(raw)
+        except ValueError:
+            return None
+        if not -float("inf") < stamp < float("inf"):
+            return None
+        stamp = max(0.0, min(duration, stamp))
+        if stamp < cursor or (kind == "start") == silent:
+            return None
+        if kind == "start":
+            gap = stamp - cursor
+            active += gap
+            longest = max(longest, gap)
+        cursor = stamp
+        silent = kind == "start"
+    if not silent:
+        gap = duration - cursor
+        active += gap
+        longest = max(longest, gap)
+    return active / duration, longest
 
 
 def _hash_json(data: Any) -> str:
@@ -1223,9 +1274,10 @@ def _mix(
         mud_db = float(mix.get("vocal_mud_cut_db", -2.2))
         if abs(mud_db) > 0.05:
             v_steps.append(f"equalizer=f=280:width_type=o:width=1.2:g={mud_db}")
-        if mix.get("vocal_gate_on", True):
-            # 极温和低电平门控：吃掉 RVC 换气/静音缝隙里的沙沙底噪，避免压缩器将其放大
-            v_steps.append("agate=threshold=0.008:ratio=2.5:attack=15:release=140")
+    if mix.get("vocal_gate_on", True):
+        # 极温和低电平门控：吃掉 RVC 换气/静音缝隙里的沙沙底噪，避免压缩器将其放大
+        v_steps.append("agate=threshold=0.008:ratio=2.5:attack=15:release=140")
+    if eq_on:
         if abs(presence_db) > 0.01:
             v_steps.append(f"equalizer=f=3200:width_type=o:width=1.1:g={presence_db}")
         deess_db = float(mix.get("vocal_deess_db", -2.2))
@@ -1234,13 +1286,13 @@ def _mix(
             v_steps.append(f"equalizer=f=6200:width_type=o:width=1.0:g={deess_db}")
         if abs(air_db) > 0.01:
             v_steps.append(f"treble=g={air_db}:f=9500")
-        if mix.get("vocal_compress", True):
-            # 经典录音棚串联双级压缩（LA-2A 慢速光电稳态 + 1176 快速峰值护栏）：
-            # 轻声主歌自动托起不闷，高音爆发瞬态顺滑收住不扎耳，避免大幅动态波动
-            v_steps.append(
-                "acompressor=threshold=-18dB:ratio=1.8:attack=35:release=280:knee=4:makeup=1.50,"
-                "acompressor=threshold=-9dB:ratio=2.6:attack=6:release=90:knee=2:makeup=1.10"
-            )
+    if mix.get("vocal_compress", True):
+        # 经典录音棚串联双级压缩（LA-2A 慢速光电稳态 + 1176 快速峰值护栏）：
+        # 轻声主歌自动托起不闷，高音爆发瞬态顺滑收住不扎耳，避免大幅动态波动
+        v_steps.append(
+            "acompressor=threshold=-18dB:ratio=1.8:attack=35:release=280:knee=4:makeup=1.50,"
+            "acompressor=threshold=-9dB:ratio=2.6:attack=6:release=90:knee=2:makeup=1.10"
+        )
     v_steps.append(f"aresample={sr}")
     v_chain = ",".join(v_steps)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import shutil
@@ -48,6 +49,23 @@ def _iter_cache_files(root: Path):
         except OSError:
             pass
     return sorted(files)
+
+
+def _is_job_dir(path: Path) -> bool:
+    """只把含有效任务状态文件的目录视为可清理任务。"""
+    if not re.fullmatch(r"[0-9a-f]{12}", path.name):
+        return False
+    try:
+        if path.resolve() != path.parent.resolve() / path.name:
+            return False
+        state = path / "job.json"
+        if not (path / "spec.json").is_file() or not state.is_file() or state.is_symlink():
+            return False
+        data = json.loads(state.read_text(encoding="utf-8"))
+        return (isinstance(data, dict) and data.get("id") == path.name
+                and data.get("status") in ("done", "failed", "cancelled", "interrupted"))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def clean(root: Path, cfg: dict[str, Any], skip_names: set[str] | None = None,
@@ -108,7 +126,7 @@ def clean(root: Path, cfg: dict[str, Any], skip_names: set[str] | None = None,
     removed_jobs = 0
     if keep_jobs > 0:
         folders = sorted(
-            [p for p in root.iterdir() if p.is_dir() and p.name != "cache" and p.name not in skip_names],
+            [p for p in root.iterdir() if _is_job_dir(p) and p.name not in skip_names],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -143,16 +161,12 @@ def collect_skip_ids(manager) -> set[str]:
     定时清理与手动 /cache/clean 必须共用这套逻辑，否则手动强制清空可能
     删掉排队任务的目录和 spec.json，导致任务状态损坏。
     """
-    skip: set[str] = set()
-    active = getattr(manager, "_active", None)
-    if active:
-        skip.add(str(active))
-    queued = getattr(manager, "_queue", None)
-    if queued is not None:
-        for item in getattr(queued, "_queue", []) or []:
-            jid = getattr(item, "job_id", None) or (item if isinstance(item, str) else None)
-            if jid:
-                skip.add(str(jid))
+    with manager._lock:
+        skip = {jid for jid, job in manager._jobs.items() if job.status in ("queued", "running")}
+        if manager._active:
+            skip.add(manager._active)
+    with manager._queue.mutex:
+        skip.update(manager._queue.queue)
     return skip
 
 
@@ -178,48 +192,30 @@ async def periodic(manager, cfg_getter, interval_hours: float) -> None:
 
 
 def clean_all(root: Path, skip_names: set[str] | None = None, on_job_removed=None) -> dict[str, Any]:
-    """强制清空 cache/ 下所有缓存文件（sep + final），不影响活动任务目录。
+    """强制清空 cache/ 下所有缓存文件，保留全部任务目录。
 
-    用于手动「清空缓存」：无视所有阈值，把占用一次性释放。
+    保留 skip_names 和 on_job_removed 参数以兼容旧调用方；force 仅影响缓存。
     """
-    skip_names = skip_names or set()
     cache = root / "cache"
     removed = 0
     freed = 0
-    if cache.is_dir():
+    if cache.is_dir() and cache.resolve() == root.resolve() / "cache":
         for p in sorted(cache.rglob("*"), key=lambda x: len(x.parts), reverse=True):
             try:
+                if p.parent.resolve() != root.resolve() / p.parent.relative_to(root):
+                    continue
                 if p.is_file():
-                    freed += p.stat().st_size
+                    size = p.stat().st_size
                     p.unlink()
                     removed += 1
+                    freed += size
                 elif p.is_dir():
                     p.rmdir()
             except OSError:
                 pass
-    # 顺带清掉不在白名单里的旧任务目录（活动任务跳过）
-    removed_jobs = 0
-    removed_job_ids: list[str] = []
-    if root.is_dir():
-        for folder in root.iterdir():
-            if not folder.is_dir() or folder.name == "cache" or folder.name in skip_names:
-                continue
-            # 只删看起来像 job_id 的目录（避免误删未知目录）
-            if re.fullmatch(r"[0-9a-fA-F_-]{8,}", folder.name):
-                try:
-                    sz = _dir_size(folder)
-                    shutil.rmtree(folder)
-                    freed += sz
-                    removed_jobs += 1
-                    removed_job_ids.append(folder.name)
-                except OSError as exc:
-                    logger.warning("删除旧任务目录失败 %s: %s", folder.name, exc)
-    if removed_job_ids and on_job_removed:
-        with contextlib.suppress(Exception):
-            on_job_removed(removed_job_ids)
     result = {
         "removed_files": removed,
-        "removed_jobs": removed_jobs,
+        "removed_jobs": 0,
         "freed_mb": round(freed / 1024 / 1024, 1),
         "cache_size_mb": round(_dir_size(cache) / 1024 / 1024, 1),
     }
